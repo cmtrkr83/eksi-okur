@@ -100,4 +100,4 @@ Bu proje MIT lisansı altında lisanslanmıştır. Ayrıntılar için [LICENSE](
 GitHub: [cmtrkr83](https://github.com/cmtrkr83)  
 Buymeacoffee: [cmtrkr](https://www.buymeacoffee.com/cmtrkr)
 
-İşinize yaradıysa bir kahve ırkıtırmak isterseniz memnuniyetle kabul ederim. ☕
+İşinize yaradıysa bir kahve ısmarlamak isterseniz memnuniyetle kabul ederim. ☕
