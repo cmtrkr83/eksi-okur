@@ -49,6 +49,19 @@ Ekşi Sözlük gündem, debe, başlıklar ve entry'ler için hızlı, sade ve mo
 - 📝 **Entry Yaz** — Ekşi Sözlük'e entry gir.
 - ⚡ **Hafif ve Hızlı** — Sade arayüz, hızlı okuma deneyimi.
 
+## 📚 Konular ve Kanallar
+
+Ekşi Okur'da şu konu ve kanal kategorileri mevcut:
+
+| Kategori | Açıklama |
+|----------|----------|
+| 🔥 Gündem | Güncel ve popüler başlıklar |
+| ⭐ Debe | En beğenilen başlıklar |
+| 📅 Bugün | Bugün yazılan entry'ler |
+| 🏷️ Kanallar | Spor, Siyaset, Teknoloji, Sinema, Müzik, Bilim, Edebiyat, Ekonomi, Tarih, Oyun, Eğitim, Sağlık, Sanat, Otomobil |
+
+Her konuda **Tümü**, **Popüler**, **Şükela** ve **Bugünün Şükelası** filtreleri kullanılabilir.
+
 ## 🏗️ Proje Yapısı
 
 ```text
