@@ -1,0 +1,29 @@
+<resources>
+    <string name="app_name">Ekşi Okur</string>
+    <string name="nav_gundem">Gündem</string>
+    <string name="nav_search">Ara</string>
+    <string name="nav_messages">Mesajlar</string>
+    <string name="nav_bookmarks">Arşiv</string>
+    <string name="nav_settings">Ayarlar</string>
+    <string name="tab_gundem">Gündem</string>
+    <string name="tab_debe">Debe</string>
+    <string name="tab_bugun">Bugün</string>
+    <string name="tab_kanallar">Kanallar</string>
+    <string name="search_hint">Başlık, @yazar veya #kanal ara…</string>
+    <string name="retry">Tekrar Dene</string>
+    <string name="verify_in_browser">Tarayıcıda Doğrula</string>
+    <string name="sign_in_eksi">Ekşi Sözlük\'e Giriş Yap</string>
+    <string name="sign_out">Çıkış Yap</string>
+    <string name="empty_bookmarks_title">Henüz kaydedilen bir şey yok</string>
+    <string name="empty_bookmarks_subtitle">Beğendiğiniz başlıkları veya entry\'leri yer imlerine ekleyerek çevrimdışı da okuyabilirsiniz.</string>
+    <string name="empty_history_title">Okuma geçmişiniz boş</string>
+    <string name="empty_history_subtitle">Gündemden bir başlık açtığınızda son okuduklarınız burada listelenir.</string>
+    <string name="cache_banner">Çevrimdışı önbellekten gösteriliyor</string>
+    <string name="share">Paylaş</string>
+    <string name="open_in_browser">Tarayıcıda Aç</string>
+    <string name="bookmark_add">Kaydet</string>
+    <string name="bookmark_remove">Kaydedildi</string>
+    <string name="spoiler_show">Spoiler\'ı Göster</string>
+    <string name="spoiler_hide">Spoiler\'ı Gizle</string>
+    <string name="all_entries_cta">Başlığın Tümünü Gör</string>
+</resources>

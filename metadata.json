@@ -1,0 +1,6 @@
+{
+  "name": "Ekşi Okur",
+  "description": "Ekşi Sözlük gündem, debe, başlıklar ve entry'ler için hızlı, sade ve modern Android okuma istemcisi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
