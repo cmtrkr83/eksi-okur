@@ -1,5 +1,7 @@
 # Ekşi Okur
 
+Tamamen kendim için yaptığım reklamsız sade bir ekşi istemcisi. Entry girebilir, mesaj gönderip silebilir yada sözlükte gezinebilirsiniz.
+
 Ekşi Sözlük gündem, debe, başlıklar ve entry'ler için hızlı, sade ve modern Android okuma istemcisi.
 
 <p align="center">
