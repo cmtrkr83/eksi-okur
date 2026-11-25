@@ -65,7 +65,7 @@ class MessagesViewModel(
         loadInbox()
     }
 
-    fun loadInbox(isPullRefresh: Boolean = false) {
+    fun loadInbox(isPullRefresh: Boolean = false, excludeThreadId: String? = null, excludeThreadUrl: String? = null) {
         viewModelScope.launch {
             val archived = _uiState.value.showArchived
             _uiState.update {
@@ -73,10 +73,29 @@ class MessagesViewModel(
                 else it.copy(inboxResult = UiResult.Loading)
             }
             val res = repository.getMessageInbox(archived = archived)
+            // Silinen mesajın sunucu yanıtıyla geri gelmesini engelle (race condition).
+            val filteredRes = when (res) {
+                is UiResult.Success -> {
+                    val excludedThreads = if (excludeThreadId != null || excludeThreadUrl != null) {
+                        res.data.threads.filterNot { t ->
+                            (excludeThreadId != null && t.threadId == excludeThreadId) ||
+                                (excludeThreadUrl != null && t.threadUrl == excludeThreadUrl)
+                        }
+                    } else {
+                        res.data.threads
+                    }
+                    UiResult.Success(
+                        data = res.data.copy(threads = excludedThreads),
+                        isFromCache = res.isFromCache,
+                        cachedAtMillis = res.cachedAtMillis
+                    )
+                }
+                else -> res
+            }
             _uiState.update {
                 it.copy(
                     isRefreshingInbox = false,
-                    inboxResult = res
+                    inboxResult = filteredRes
                 )
             }
         }
@@ -335,31 +354,46 @@ class MessagesViewModel(
                 fallbackToken = fallbackToken
             )
             result.onSuccess {
-                _uiState.update { current ->
-                    val currentInbox = current.inboxResult as? UiResult.Success
-                    val updatedInbox = if (currentInbox != null) {
-                        UiResult.Success(
-                            data = currentInbox.data.copy(
-                                threads = currentInbox.data.threads.filterNot {
-                                    it.threadId == thread.threadId && it.threadUrl == thread.threadUrl
-                                }
-                            ),
-                            isFromCache = currentInbox.isFromCache,
-                            cachedAtMillis = currentInbox.cachedAtMillis
+                // Sunucuda gerçekten silinip silinmediğini doğrula; sadece optimist silmeyle
+                // "silindi" dememek için gerçek silme doğrulaması gerekiyor.
+                val normalizedPath = EksiHtmlParser.normalizePath(thread.threadUrl)
+                val isReallyDeleted = repository.verifyMessageThreadDeleted(normalizedPath, thread.threadId)
+
+                if (isReallyDeleted) {
+                    _uiState.update { current ->
+                        val currentInbox = current.inboxResult as? UiResult.Success
+                        val updatedInbox = if (currentInbox != null) {
+                            UiResult.Success(
+                                data = currentInbox.data.copy(
+                                    threads = currentInbox.data.threads.filterNot {
+                                        it.threadId == thread.threadId && it.threadUrl == thread.threadUrl
+                                    }
+                                ),
+                                isFromCache = currentInbox.isFromCache,
+                                cachedAtMillis = currentInbox.cachedAtMillis
+                            )
+                        } else {
+                            current.inboxResult
+                        }
+                        val clearedActive = if (current.activeThreadUrl == thread.threadUrl) null else current.activeThreadUrl
+                        current.copy(
+                            deletingThreadIds = current.deletingThreadIds - thread.threadId,
+                            inboxResult = updatedInbox,
+                            activeThreadUrl = clearedActive,
+                            actionMessage = "@${thread.participantNick} ile olan mesaj silindi"
                         )
-                    } else {
-                        current.inboxResult
                     }
-                    val clearedActive = if (current.activeThreadUrl == thread.threadUrl) null else current.activeThreadUrl
-                    current.copy(
-                        deletingThreadIds = current.deletingThreadIds - thread.threadId,
-                        inboxResult = updatedInbox,
-                        activeThreadUrl = clearedActive,
-                        actionMessage = "@${thread.participantNick} ile olan mesaj silindi"
-                    )
+                    onDeleted?.invoke()
+                    delay(1000)
+                    loadInbox(isPullRefresh = true, excludeThreadId = thread.threadId, excludeThreadUrl = thread.threadUrl)
+                } else {
+                    _uiState.update { current ->
+                        current.copy(
+                            deletingThreadIds = current.deletingThreadIds - thread.threadId,
+                            actionMessage = "Mesaj silinemedi. Lütfen tekrar deneyiniz."
+                        )
+                    }
                 }
-                onDeleted?.invoke()
-                loadInbox(isPullRefresh = true)
             }.onFailure { err ->
                 when (err) {
                     is WebDeleteFallbackException -> {
@@ -455,7 +489,8 @@ class MessagesViewModel(
                     )
                 }
                 onDeleted?.invoke()
-                loadInbox(isPullRefresh = true)
+                delay(1000)
+                loadInbox(isPullRefresh = true, excludeThreadId = request.thread.threadId, excludeThreadUrl = request.thread.threadUrl)
             } else {
                 _uiState.update { current ->
                     current.copy(
@@ -463,7 +498,8 @@ class MessagesViewModel(
                         actionMessage = "Mesaj silinemedi. Sayfa içinden Sil'e basıp Tamamlandı ile onaylayabilirsiniz."
                     )
                 }
-                loadInbox(isPullRefresh = true)
+                delay(1000)
+                loadInbox(isPullRefresh = true, excludeThreadId = request.thread.threadId, excludeThreadUrl = request.thread.threadUrl)
             }
         }
     }

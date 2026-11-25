@@ -47,9 +47,14 @@ class EksiApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // CookieManager'ı erken başlat ki WebViewCookieJar çerezleri
+        // uygulama yeniden başlatıldığında da süresin (oturum kalıcılığı).
+        android.webkit.CookieManager.getInstance()
         container = EksiAppContainer(this)
         MessageNotificationHelper.ensureChannel(this)
         appScope.launch {
+            // Çerezlerden oturumu geri yükle (giriş yapılmışsa nick'i doldurur).
+            container.repository.refreshSessionUser()
             val prefs = runCatching { container.repository.userPreferences.first() }.getOrNull()
             if (prefs?.messageNotificationsEnabled != false) {
                 MessageNotificationScheduler.syncPeriodicWork(this@EksiApplication, true)

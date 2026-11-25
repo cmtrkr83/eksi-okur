@@ -8,6 +8,7 @@ import com.example.data.model.TopicDetail
 import com.example.data.model.TopicFilter
 import com.example.data.model.TopicItem
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaType
@@ -863,6 +864,7 @@ class EksiNetworkDataSource(
             var meaningfulError: Throwable? = null
             var last404Error: Throwable? = null
             var cfError: CloudflareChallengeException? = null
+            var nominalSuccessCount = 0
 
             fun recordOutcomeError(err: Throwable) {
                 when {
@@ -870,6 +872,16 @@ class EksiNetworkDataSource(
                     err.message?.contains("404") == true -> last404Error = err
                     else -> meaningfulError = err
                 }
+            }
+
+            // A 2xx answer from a guessed endpoint is not proof of deletion: Ekşi can reply
+            // with the inbox/thread page again. Only trust it when the thread is really gone.
+            suspend fun confirmedDeleted(path: String): Boolean {
+                val verified = verifyThreadDeletedFromInbox(path, discoveredId)
+                if (!verified && meaningfulError == null) {
+                    meaningfulError = IOException("Mesaj silinemedi.")
+                }
+                return verified
             }
 
             // Stage 1: try pre-parsed inbox delete metadata directly if token is already present
@@ -890,7 +902,14 @@ class EksiNetworkDataSource(
                             fallbackToken = stage1Token
                         )
                     ) {
-                        DeleteCallOutcome.Success -> return@withContext Result.success(Unit)
+                        DeleteCallOutcome.Success -> {
+                            nominalSuccessCount++
+                            if (nominalSuccessCount == 1 &&
+                                confirmedDeleted(normalizedThreadPath)
+                            ) {
+                                return@withContext Result.success(Unit)
+                            }
+                        }
                         is DeleteCallOutcome.RetryNext -> recordOutcomeError(outcome.error)
                     }
                 }
@@ -1013,13 +1032,24 @@ class EksiNetworkDataSource(
                             fallbackToken = resolvedToken
                         )
                     ) {
-                        DeleteCallOutcome.Success -> return@withContext Result.success(Unit)
+                        DeleteCallOutcome.Success -> {
+                            nominalSuccessCount++
+                            if (nominalSuccessCount == 1 &&
+                                confirmedDeleted(resolvedThreadPath)
+                            ) {
+                                return@withContext Result.success(Unit)
+                            }
+                        }
                         is DeleteCallOutcome.RetryNext -> recordOutcomeError(outcome.error)
                     }
                 }
             }
 
-            // Stage 3a: check if one of the HTTP calls actually deleted the thread on server despite non-2xx/redirect quirk
+            // Stage 3a: give the server a moment, then verify once more. This also covers the
+            // case where one of the HTTP calls worked but answered with an unexpected status.
+            if (nominalSuccessCount > 0) {
+                delay(700)
+            }
             if (verifyThreadDeletedFromInbox(resolvedPathForFallback, discoveredId)) {
                 return@withContext Result.success(Unit)
             }
@@ -1135,20 +1165,65 @@ class EksiNetworkDataSource(
         return list
     }
 
+    /**
+     * Returns true only when we have positive evidence that the conversation is gone:
+     * it is missing from both the regular and archived inbox, and its own page no longer
+     * renders any messages. Failed/ambiguous checks return false so the caller never
+     * announces a deletion that did not happen.
+     */
     private suspend fun verifyThreadDeletedFromInbox(
         normalizedThreadPath: String,
         threadId: String
     ): Boolean {
-        val inbox = runCatching { fetchMessageInbox(archived = false).data }.getOrNull() ?: return false
-        if (inbox.requiresLogin) return false
-        val cleanTargetPath = normalizedThreadPath.substringBefore("?").trimEnd('/')
+        val cleanTargetPath = EksiHtmlParser.normalizePath(normalizedThreadPath)
+            .substringBefore("?")
+            .trimEnd('/')
         val cleanId = threadId.trim()
-        val stillPresent = inbox.threads.any { item ->
-            val itemPath = EksiHtmlParser.normalizePath(item.threadUrl).substringBefore("?").trimEnd('/')
-            (cleanTargetPath.isNotBlank() && itemPath.equals(cleanTargetPath, ignoreCase = true)) ||
-                (cleanId.isNotBlank() && item.threadId.trim() == cleanId)
+
+        var usableInbox = false
+        for (archived in listOf(false, true)) {
+            val page = runCatching { fetchMessageInbox(archived = archived) }.getOrNull() ?: continue
+            val inbox = page.data
+            if (inbox.requiresLogin) continue
+            if (inbox.threads.isEmpty() && !EksiHtmlParser.looksLikeMessageInbox(page.rawHtml)) continue
+            usableInbox = true
+            val stillPresent = inbox.threads.any { item ->
+                EksiHtmlParser.messageThreadMatches(
+                    itemPath = item.threadUrl,
+                    itemId = item.threadId,
+                    targetPath = cleanTargetPath,
+                    targetId = cleanId
+                )
+            }
+            if (stillPresent) return false
         }
-        return !stillPresent
+
+        if (!usableInbox) return false
+
+        // The inbox only exposes the first page, so also check the conversation itself.
+        // This prevents a thread that lives on page 2+ from being reported as deleted.
+        if (cleanTargetPath.isBlank()) return false
+        val threadFullUrl = if (cleanTargetPath.startsWith("http")) {
+            cleanTargetPath
+        } else {
+            "$BASE_URL$cleanTargetPath"
+        }
+        val direct = runCatching {
+            executeGet(threadFullUrl, ajax = false, referer = "$BASE_URL/mesaj")
+        }.getOrNull() ?: return false
+
+        val (html, finalUrl) = direct
+        val finalPath = EksiHtmlParser.normalizePath(finalUrl).substringBefore("?").trimEnd('/')
+        if (finalPath.contains("/giris", ignoreCase = true)) return false
+        if (finalPath != cleanTargetPath) {
+            // Redirected back to the inbox/home because the conversation no longer exists.
+            return true
+        }
+        val detail = runCatching {
+            EksiHtmlParser.parseMessageThread(html, cleanTargetPath, null)
+        }.getOrNull() ?: return false
+        if (detail.requiresLogin) return false
+        return detail.messages.isEmpty()
     }
 
     private fun executeDeleteCandidate(
@@ -1383,27 +1458,50 @@ class EksiNetworkDataSource(
                 }
             }
 
-            // 2. Concise high-probability fallback endpoints (fast ~2s probe before WebView fallback)
+            // 2. Concise high-probability fallback endpoints.
+            // /mesaj/sil expects the bulk-form field name "threadId"; older variants used
+            // "id"/"threadIds", so all of them are probed (form-encoded first).
             val fallbackRoutes = listOf(
                 "/mesaj/sil",
-                "/mesaj/konusma/sil",
-                "/mesaj/deleteprocessthread",
-                "/mesaj/deletethread"
+                "/mesaj/konusma/sil"
             )
+            val idFieldNames = listOf("threadId", "id", "threadIds").distinct()
             for (route in fallbackRoutes) {
-                val idFields = LinkedHashMap<String, String>().apply {
-                    if (token.isNotBlank()) put("__RequestVerificationToken", token)
-                    put("id", idForFastProbe)
+                if (route.contains("konusma", ignoreCase = true)) {
+                    for (fieldName in listOf("id", "threadId").distinct()) {
+                        val fields = LinkedHashMap<String, String>().apply {
+                            if (token.isNotBlank()) put("__RequestVerificationToken", token)
+                            put(fieldName, idForFastProbe)
+                        }
+                        list.add(DeleteCandidate(route, fields, isAjax = true, method = "POST", isJsonBody = false))
+                    }
+                    continue
                 }
-                val threadFields = LinkedHashMap<String, String>().apply {
-                    if (token.isNotBlank()) put("__RequestVerificationToken", token)
-                    put("threadId", idForFastProbe)
-                    if (maxMessageId != null) put("maxMessageId", maxMessageId.toString())
+                for (fieldName in idFieldNames) {
+                    val fields = LinkedHashMap<String, String>().apply {
+                        if (token.isNotBlank()) put("__RequestVerificationToken", token)
+                        put(fieldName, idForFastProbe)
+                        if (fieldName == "threadId" && maxMessageId != null) {
+                            put("maxMessageId", maxMessageId.toString())
+                        }
+                    }
+                    list.add(DeleteCandidate(route, fields, isAjax = true, method = "POST", isJsonBody = false))
                 }
-                list.add(DeleteCandidate(route, idFields, isAjax = true, method = "POST", isJsonBody = false))
-                list.add(DeleteCandidate(route, threadFields, isAjax = true, method = "POST", isJsonBody = true))
-                if (threadListJson != null && route.contains("process", ignoreCase = true)) {
-                    list.add(DeleteCandidate(route, idFields, isAjax = true, method = "POST", isJsonBody = true, rawJsonBody = threadListJson))
+                if (threadListJson != null) {
+                    val idFields = LinkedHashMap<String, String>().apply {
+                        if (token.isNotBlank()) put("__RequestVerificationToken", token)
+                        put("id", idForFastProbe)
+                    }
+                    list.add(
+                        DeleteCandidate(
+                            route,
+                            idFields,
+                            isAjax = true,
+                            method = "POST",
+                            isJsonBody = true,
+                            rawJsonBody = threadListJson
+                        )
+                    )
                 }
             }
 
@@ -1419,7 +1517,7 @@ class EksiNetworkDataSource(
 
         return list.distinctBy {
             "${it.method}|${it.action}|${it.isAjax}|${it.isJsonBody}|${it.rawJsonBody}|${it.fields.entries.joinToString()}"
-        }.take(24)
+        }.take(16)
     }
 
     private data class DeleteCandidate(

@@ -547,6 +547,40 @@ object EksiHtmlParser {
         )
     }
 
+    /**
+     * True when the given HTML is an actual message inbox (even an empty one), so callers don't
+     * mistake an error/blank page for "the thread is gone".
+     */
+    fun looksLikeMessageInbox(html: String): Boolean {
+        if (html.isBlank()) return false
+        val lower = html.lowercase()
+        return lower.contains("id=\"threads\"") ||
+            lower.contains("id='threads'") ||
+            lower.contains("message-thread-list") ||
+            lower.contains("id=\"message-thread\"") ||
+            lower.contains("mesajlarım") ||
+            lower.contains("/mesaj/sil")
+    }
+
+    fun messageThreadMatches(
+        itemPath: String,
+        itemId: String,
+        targetPath: String,
+        targetId: String
+    ): Boolean {
+        val cleanItemPath = normalizePath(itemPath).substringBefore("?").trimEnd('/')
+        val cleanTargetPath = normalizePath(targetPath).substringBefore("?").trimEnd('/')
+        if (cleanTargetPath.isNotBlank() &&
+            cleanItemPath.isNotBlank() &&
+            cleanItemPath.equals(cleanTargetPath, ignoreCase = true)
+        ) {
+            return true
+        }
+        val cleanItemId = itemId.trim()
+        val cleanTargetId = targetId.trim()
+        return cleanTargetId.isNotBlank() && cleanItemId == cleanTargetId
+    }
+
     fun parseMessageThread(
         html: String,
         requestedUrl: String,
@@ -777,8 +811,19 @@ object EksiHtmlParser {
             isDeleteMessageForm(form)
         } ?: return null
 
-        val action = deleteForm.attr("action").trim().ifBlank { "/mesaj/sil" }
+        val deleteButton = deleteForm.select("button, input[type=submit]")
+            .firstOrNull { isDeleteSubmitControl(it) }
+        // The bulk form on /mesaj may point its action at the archive endpoint and use
+        // formaction="..." on the delete button, so prefer the button target.
+        val action = deleteButton?.attr("formaction")?.trim()?.takeIf { it.isNotBlank() }
+            ?: deleteForm.attr("action").trim().ifBlank { "/mesaj/sil" }
         val fields = collectDeleteFormFields(deleteForm, fallbackToken)
+        deleteButton?.let { btn ->
+            val name = btn.attr("name").trim()
+            if (name.isNotBlank() && !fields.containsKey(name)) {
+                fields[name] = btn.attr("value").ifBlank { btn.text().trim().ifBlank { "sil" } }
+            }
+        }
         val isAjax = deleteForm.attr("data-ajax").equals("true", ignoreCase = true)
         return MessageDeleteMeta(action = action, fields = fields, isAjax = isAjax)
     }
@@ -945,6 +990,13 @@ object EksiHtmlParser {
 
     private fun isDeleteMessageForm(form: Element): Boolean {
         if (form.selectFirst("textarea") != null) return false
+        val deleteSubmit = form.select("button, input[type=submit]")
+            .firstOrNull { isDeleteSubmitControl(it) }
+        if (deleteSubmit != null) {
+            val submitAction = deleteSubmit.attr("formaction").lowercase()
+            return !(submitAction.contains("giris") || submitAction.contains("arsiv") ||
+                submitAction.contains("engelle") || submitAction.contains("okundu"))
+        }
         val action = form.attr("action").lowercase()
         val id = form.id().lowercase()
         val cls = form.className().lowercase()
@@ -964,12 +1016,38 @@ object EksiHtmlParser {
         val actionIsDelete = (action.contains("sil") || action.contains("delete") || action.contains("remove") ||
             action.contains("kaldir") || action.contains("temizle"))
         val attrIsDelete = id.contains("delete") || id.contains("sil") || cls.contains("delete")
-        val textIsDelete = submitText == "sil" ||
-            submitText.contains("konuşmayı sil") ||
-            submitText.contains("sohbeti sil") ||
-            submitText.contains("mesajı sil") ||
-            submitText.contains("mesajları sil")
+        val textIsDelete = submitText.contains("sil") ||
+            submitText.contains("delete") ||
+            submitText.contains("kaldır") ||
+            submitText.contains("temizle")
         return actionIsDelete || attrIsDelete || textIsDelete
+    }
+
+    /**
+     * Matches a button/input that submits a "delete" action, ignoring archive/block/read actions.
+     */
+    private fun isDeleteSubmitControl(el: Element): Boolean {
+        val tag = el.tagName().lowercase()
+        val type = el.attr("type").lowercase()
+        if (tag == "input" && type != "submit" && type != "button") return false
+        if (tag == "a") return false
+        val label = listOf(
+            el.text(),
+            el.attr("value"),
+            el.attr("title"),
+            el.attr("aria-label"),
+            el.attr("data-original-title"),
+            el.attr("formaction")
+        ).joinToString(" ").lowercase()
+        if (label.contains("arsiv") || label.contains("arşiv") ||
+            label.contains("engelle") || label.contains("okundu") ||
+            label.contains("giris") || label.contains("giriş")
+        ) {
+            return false
+        }
+        return label.contains("sil") || label.contains("delete") ||
+            label.contains("kaldır") || label.contains("kaldir") ||
+            label.contains("temizle")
     }
 
     private fun collectDeleteFormFields(
