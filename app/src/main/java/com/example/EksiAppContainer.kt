@@ -8,7 +8,10 @@ import com.example.data.local.EksiDatabase
 import com.example.data.local.UserPreferencesRepository
 import com.example.data.network.EksiNetworkDataSource
 import com.example.data.network.WebViewCookieJar
+import com.example.data.network.WebViewHtmlFetcher
 import com.example.data.repository.EksiRepository
+import com.example.notifications.MessageNotificationHelper
+import com.example.notifications.MessageNotificationScheduler
 import com.example.ui.viewmodel.AuthorViewModel
 import com.example.ui.viewmodel.FeedViewModel
 import com.example.ui.viewmodel.LibraryViewModel
@@ -16,11 +19,17 @@ import com.example.ui.viewmodel.MessagesViewModel
 import com.example.ui.viewmodel.SearchViewModel
 import com.example.ui.viewmodel.SettingsViewModel
 import com.example.ui.viewmodel.TopicViewModel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 class EksiAppContainer(context: Context) {
     private val appContext = context.applicationContext
     val cookieJar = WebViewCookieJar()
-    private val networkDataSource = EksiNetworkDataSource(cookieJar)
+    private val webViewFetcher = WebViewHtmlFetcher(appContext)
+    private val networkDataSource = EksiNetworkDataSource(cookieJar, webViewFetcher)
     private val database = EksiDatabase.getInstance(appContext)
     private val preferencesRepository = UserPreferencesRepository(appContext)
     val repository = EksiRepository(
@@ -34,9 +43,18 @@ class EksiApplication : Application() {
     lateinit var container: EksiAppContainer
         private set
 
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     override fun onCreate() {
         super.onCreate()
         container = EksiAppContainer(this)
+        MessageNotificationHelper.ensureChannel(this)
+        appScope.launch {
+            val prefs = runCatching { container.repository.userPreferences.first() }.getOrNull()
+            if (prefs?.messageNotificationsEnabled != false) {
+                MessageNotificationScheduler.syncPeriodicWork(this@EksiApplication, true)
+            }
+        }
     }
 }
 

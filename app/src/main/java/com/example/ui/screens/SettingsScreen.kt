@@ -1,6 +1,9 @@
 package com.example.ui.screens
 
+import android.Manifest
 import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -20,6 +23,7 @@ import androidx.compose.material.icons.automirrored.rounded.Login
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.AccountCircle
 import androidx.compose.material.icons.rounded.CleaningServices
+import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.TextFields
 import androidx.compose.material3.Button
@@ -44,11 +48,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.local.FontScaleOption
 import com.example.data.local.ThemeMode
+import com.example.notifications.MessageNotificationHelper
+import com.example.notifications.MessageNotificationScheduler
 import com.example.ui.components.WebAuthDialog
 import com.example.ui.viewmodel.SettingsViewModel
 import kotlin.math.abs
@@ -62,8 +69,27 @@ fun SettingsScreen(
 ) {
     val prefs by viewModel.preferences.collectAsStateWithLifecycle()
     val statusMessage by viewModel.statusMessage.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     var showLoginDialog by remember { mutableStateOf(false) }
+    var hasNotificationPermission by remember {
+        mutableStateOf(MessageNotificationHelper.hasNotificationPermission(context))
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasNotificationPermission = granted || MessageNotificationHelper.hasNotificationPermission(context)
+        if (hasNotificationPermission) {
+            viewModel.setMessageNotificationsEnabled(true)
+            MessageNotificationScheduler.syncPeriodicWork(context, true)
+            MessageNotificationScheduler.triggerImmediateCheck(context)
+        } else {
+            viewModel.setMessageNotificationsEnabled(false)
+            MessageNotificationScheduler.syncPeriodicWork(context, false)
+            viewModel.showStatusMessage("Bildirim izni verilmedi; bildirimler kapalı kaldı.")
+        }
+    }
 
     LaunchedEffect(statusMessage) {
         val msg = statusMessage
@@ -122,7 +148,7 @@ fun SettingsScreen(
                                     text = if (prefs.loggedInNick != null) {
                                         "Ekşi Sözlük hesabınız bağlı"
                                     } else {
-                                        "Favori ve doğrulama için Ekşi Sözlük ile giriş yapın"
+                                        "Mesajlaşma, entry yazma ve favori için giriş yapın"
                                     },
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -311,6 +337,91 @@ fun SettingsScreen(
                 }
             }
 
+            // Notifications Card
+            item(key = "notifications_card") {
+                val notificationsActive = prefs.messageNotificationsEnabled && hasNotificationPermission
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Rounded.NotificationsActive,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                text = "Bildirimler",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Özel Mesaj Bildirimleri", style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    text = if (!hasNotificationPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                        "Bildirim alabilmek için sistem bildirim izni vermeniz gerekir"
+                                    } else {
+                                        "Yeni özel mesaj geldiğinde arka planda kontrol edip bildirim gönderir"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(Modifier.width(10.dp))
+                            Switch(
+                                checked = notificationsActive,
+                                onCheckedChange = { enable ->
+                                    if (enable) {
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                            !MessageNotificationHelper.hasNotificationPermission(context)
+                                        ) {
+                                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                        } else {
+                                            viewModel.setMessageNotificationsEnabled(true)
+                                            MessageNotificationScheduler.syncPeriodicWork(context, true)
+                                            MessageNotificationScheduler.triggerImmediateCheck(context)
+                                        }
+                                    } else {
+                                        viewModel.setMessageNotificationsEnabled(false)
+                                        MessageNotificationScheduler.syncPeriodicWork(context, false)
+                                    }
+                                },
+                                modifier = Modifier.testTag("settings_message_notifications_switch")
+                            )
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedButton(
+                            onClick = {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                    !MessageNotificationHelper.hasNotificationPermission(context)
+                                ) {
+                                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                } else {
+                                    viewModel.checkMessagesNow { unreadThreads ->
+                                        MessageNotificationHelper.showNewMessageNotifications(
+                                            context = context,
+                                            threads = unreadThreads
+                                        )
+                                    }
+                                }
+                            },
+                            modifier = Modifier.testTag("settings_check_messages_now_button")
+                        ) {
+                            Text("Mesajları Şimdi Kontrol Et")
+                        }
+                    }
+                }
+            }
+
             // Cache Management Card
             item(key = "cache_card") {
                 Surface(
@@ -360,6 +471,9 @@ fun SettingsScreen(
             onCompleted = { detectedNick ->
                 showLoginDialog = false
                 viewModel.refreshSession(detectedNick)
+                if (prefs.messageNotificationsEnabled) {
+                    MessageNotificationScheduler.syncPeriodicWork(context, true)
+                }
             }
         )
     }

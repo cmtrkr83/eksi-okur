@@ -13,6 +13,7 @@ import com.example.data.model.AuthorTab
 import com.example.data.model.AutocompleteResult
 import com.example.data.model.EntryItem
 import com.example.data.model.FeedCategory
+import com.example.data.model.MessageThreadSummary
 import com.example.data.model.TopicDetail
 import com.example.data.model.TopicFilter
 import com.example.data.model.TopicItem
@@ -21,6 +22,7 @@ import com.example.data.network.CloudflareChallengeException
 import com.example.data.network.EksiHtmlParser
 import com.example.data.network.EksiNetworkDataSource
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 
 class EksiRepository(
     private val network: EksiNetworkDataSource,
@@ -199,9 +201,10 @@ class EksiRepository(
     suspend fun toggleFavorite(
         entryId: Long,
         currentlyFavorited: Boolean,
-        verificationToken: String?
+        verificationToken: String?,
+        refererPath: String? = null
     ): Result<Int> {
-        return network.toggleFavorite(entryId, currentlyFavorited, verificationToken)
+        return network.toggleFavorite(entryId, currentlyFavorited, verificationToken, refererPath)
     }
 
     suspend fun postEntry(
@@ -226,6 +229,11 @@ class EksiRepository(
         return try {
             val res = network.fetchMessageInbox(archived)
             res.loggedInNick?.let { preferences.setLoggedInNick(it) }
+            if (!archived && !res.data.requiresLogin && res.data.threads.isNotEmpty()) {
+                preferences.addNotifiedMessageFingerprints(
+                    res.data.threads.map(::messageFingerprint)
+                )
+            }
             UiResult.Success(res.data)
         } catch (cf: CloudflareChallengeException) {
             UiResult.Error(
@@ -235,6 +243,34 @@ class EksiRepository(
             )
         } catch (e: Exception) {
             UiResult.Error(e.localizedMessage ?: "Mesajlar yüklenemedi.")
+        }
+    }
+
+    suspend fun fetchUnreadMessagesForNotification(
+        ignoreSeenCache: Boolean = false
+    ): Result<List<MessageThreadSummary>> {
+        val prefs = preferences.preferencesFlow.first()
+        if (!network.cookieJar.hasAnyCookies()) {
+            return Result.failure(IllegalStateException("Aktif Ekşi Sözlük oturumu bulunamadı."))
+        }
+        return try {
+            val res = network.fetchMessageInbox(archived = false)
+            res.loggedInNick?.let { preferences.setLoggedInNick(it) }
+            if (res.data.requiresLogin) {
+                return Result.failure(IllegalStateException("Mesaj kontrolü için giriş gerekli."))
+            }
+            val unread = res.data.threads.filter { it.isUnread }
+            val newlyUnread = if (ignoreSeenCache) {
+                unread
+            } else {
+                unread.filter { messageFingerprint(it) !in prefs.notifiedMessageFingerprints }
+            }
+            if (unread.isNotEmpty()) {
+                preferences.addNotifiedMessageFingerprints(unread.map(::messageFingerprint))
+            }
+            Result.success(newlyUnread)
+        } catch (e: Exception) {
+            Result.failure(e)
         }
     }
 
@@ -262,13 +298,34 @@ class EksiRepository(
         body: String,
         formMeta: com.example.data.model.MessageFormMeta?,
         refererPath: String = "/mesaj"
-    ): Result<String> {
+    ): Result<com.example.data.model.SendMessageOutcome> {
         return network.sendMessage(
             toNick = toNick,
             body = body,
             formMeta = formMeta,
             refererPath = refererPath
         )
+    }
+
+    suspend fun deleteMessageThread(
+        threadUrl: String,
+        threadId: String,
+        deleteMeta: com.example.data.model.MessageDeleteMeta?,
+        fallbackToken: String?
+    ): Result<Unit> {
+        return network.deleteMessageThread(
+            threadUrl = threadUrl,
+            threadId = threadId,
+            deleteMeta = deleteMeta,
+            fallbackToken = fallbackToken
+        )
+    }
+
+    suspend fun verifyMessageThreadDeleted(
+        threadUrl: String,
+        threadId: String
+    ): Boolean {
+        return network.verifyThreadDeleted(threadUrl, threadId)
     }
 
     suspend fun refreshSessionUser(fallbackNick: String? = null): String? {
@@ -280,6 +337,7 @@ class EksiRepository(
     suspend fun signOut() {
         network.cookieJar.clearAllCookies()
         preferences.setLoggedInNick(null)
+        preferences.clearNotifiedMessageFingerprints()
     }
 
     suspend fun toggleTopicBookmark(title: String, slugUrl: String, currentlyBookmarked: Boolean) {
@@ -338,6 +396,20 @@ class EksiRepository(
 
     private fun entryBookmarkId(entryId: Long): String = "entry:$entryId"
 
-    private fun normalizeTopicKey(slugOrUrl: String): String =
-        EksiHtmlParser.normalizePath(slugOrUrl).substringBefore("?").lowercase()
+    private fun normalizeTopicKey(slugOrUrl: String): String {
+        val normalized = EksiHtmlParser.normalizePath(slugOrUrl).substringBefore("#")
+        val path = normalized.substringBefore("?")
+        if (path == "/" || path.isBlank()) {
+            val qParam = normalized.substringAfter("?", "")
+                .split("&")
+                .firstOrNull { it.startsWith("q=", ignoreCase = true) }
+            if (!qParam.isNullOrBlank()) {
+                return "/?$qParam".lowercase()
+            }
+        }
+        return path.lowercase()
+    }
+
+    private fun messageFingerprint(thread: MessageThreadSummary): String =
+        "${thread.threadUrl}|${thread.dateText}|${thread.preview.hashCode()}"
 }

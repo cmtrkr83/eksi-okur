@@ -10,8 +10,10 @@ import com.example.data.model.TopicItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.FormBody
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
 import java.net.URLEncoder
@@ -22,6 +24,13 @@ class CloudflareChallengeException(
     message: String = "Ekşi Sözlük güvenlik doğrulaması gerekiyor."
 ) : IOException(message)
 
+class WebDeleteFallbackException(
+    val targetUrl: String,
+    val threadId: String,
+    val threadPath: String,
+    message: String = "Otomatik silme için tarayıcı doğrulaması gerekiyor."
+) : IOException(message)
+
 data class NetworkPageResult<T>(
     val data: T,
     val rawHtml: String,
@@ -30,7 +39,8 @@ data class NetworkPageResult<T>(
 )
 
 class EksiNetworkDataSource(
-    val cookieJar: WebViewCookieJar
+    val cookieJar: WebViewCookieJar,
+    private val webViewFetcher: WebViewHtmlFetcher? = null
 ) {
     companion object {
         const val BASE_URL = "https://eksisozluk.com"
@@ -61,22 +71,34 @@ class EksiNetworkDataSource(
             }
         }
         val url = "$BASE_URL$path"
-        val useAjaxHeader = category != FeedCategory.DEBE
-        val response = executeGet(url, ajax = useAjaxHeader)
+        val isDebe = category == FeedCategory.DEBE
+        val useAjaxHeader = !isDebe
+        var items: List<TopicItem> = emptyList()
+        var finalHtml = ""
+        var finalUrl = url
 
-        // Fallback to non-AJAX endpoint if AJAX returned empty list
-        var items = EksiHtmlParser.parseTopicList(
-            html = response.first,
-            isDebe = category == FeedCategory.DEBE
-        )
-        var finalHtml = response.first
-        var finalUrl = response.second
+        if (useAjaxHeader) {
+            val ajaxAttempt = runCatching {
+                executeGet(url, ajax = true, allowWebViewFallback = false)
+            }.onFailure { err ->
+                if (err is kotlinx.coroutines.CancellationException) throw err
+            }.getOrNull()
 
-        if (items.isEmpty() && useAjaxHeader) {
-            val fallback = executeGet(url, ajax = false)
-            items = EksiHtmlParser.parseTopicList(fallback.first, isDebe = false)
-            finalHtml = fallback.first
-            finalUrl = fallback.second
+            if (ajaxAttempt != null) {
+                val parsed = EksiHtmlParser.parseTopicList(ajaxAttempt.first, isDebe = false)
+                if (parsed.isNotEmpty()) {
+                    items = parsed
+                    finalHtml = ajaxAttempt.first
+                    finalUrl = ajaxAttempt.second
+                }
+            }
+        }
+
+        if (items.isEmpty()) {
+            val fullAttempt = executeGet(url, ajax = false, allowWebViewFallback = true)
+            items = EksiHtmlParser.parseTopicList(fullAttempt.first, isDebe = isDebe)
+            finalHtml = fullAttempt.first
+            finalUrl = fullAttempt.second
         }
 
         val nick = EksiHtmlParser.parseLoggedInNick(finalHtml)
@@ -94,8 +116,61 @@ class EksiNetworkDataSource(
         filter: TopicFilter = TopicFilter.ALL
     ): NetworkPageResult<TopicDetail> = withContext(Dispatchers.IO) {
         val url = buildTopicUrl(slugOrUrl, page, filter)
-        val (html, finalUrl) = executeGet(url, ajax = false)
-        val detail = EksiHtmlParser.parseTopicDetail(html, finalUrl, filter)
+        var (html, finalUrl) = runCatching {
+            executeGet(url, ajax = false, allowWebViewFallback = true)
+        }.getOrElse { err ->
+            if (err is CloudflareChallengeException || page <= 1) throw err
+            // Try discovering the live totalPages from page 1 in case page > current totalPages returned HTTP 404/empty
+            val pageOneUrl = buildTopicUrl(slugOrUrl, 1, filter)
+            val (p1Html, p1FinalUrl) = executeGet(pageOneUrl, ajax = false, allowWebViewFallback = true)
+            val p1Detail = EksiHtmlParser.parseTopicDetail(p1Html, p1FinalUrl, filter)
+            if (p1Detail.totalPages in 1 until page && (p1Detail.entries.isNotEmpty() || p1Detail.isUkde)) {
+                if (p1Detail.totalPages == 1) {
+                    p1Html to p1FinalUrl
+                } else {
+                    val lastUrl = buildTopicUrl(p1Detail.canonicalUrl.ifBlank { slugOrUrl }, p1Detail.totalPages, filter)
+                    executeGet(lastUrl, ajax = false, allowWebViewFallback = true)
+                }
+            } else {
+                throw err
+            }
+        }
+
+        var detail = EksiHtmlParser.parseTopicDetail(html, finalUrl, filter)
+        if (page > 1 && detail.entries.isEmpty() && !detail.isUkde) {
+            val targetLastPage = if (detail.topicId != null && detail.totalPages in 1 until page) {
+                detail.totalPages
+            } else {
+                val pageOneUrl = buildTopicUrl(slugOrUrl, 1, filter)
+                val (p1Html, p1FinalUrl) = executeGet(pageOneUrl, ajax = false, allowWebViewFallback = true)
+                val p1Detail = EksiHtmlParser.parseTopicDetail(p1Html, p1FinalUrl, filter)
+                if (p1Detail.totalPages == 1 && (p1Detail.entries.isNotEmpty() || p1Detail.isUkde)) {
+                    html = p1Html
+                    finalUrl = p1FinalUrl
+                    detail = p1Detail
+                    null
+                } else if (p1Detail.totalPages in 1 until page && p1Detail.entries.isNotEmpty()) {
+                    p1Detail.totalPages
+                } else {
+                    null
+                }
+            }
+
+            if (targetLastPage != null) {
+                val clampedUrl = buildTopicUrl(detail.canonicalUrl.ifBlank { slugOrUrl }, targetLastPage, filter)
+                val (clampedHtml, clampedFinalUrl) = executeGet(clampedUrl, ajax = false, allowWebViewFallback = true)
+                val clampedDetail = EksiHtmlParser.parseTopicDetail(clampedHtml, clampedFinalUrl, filter)
+                if (clampedDetail.entries.isNotEmpty() || clampedDetail.isUkde) {
+                    html = clampedHtml
+                    finalUrl = clampedFinalUrl
+                    detail = clampedDetail
+                }
+            }
+
+            if (detail.entries.isEmpty() && !detail.isUkde) {
+                throw IOException("Sayfa $page bulunamadı.")
+            }
+        }
         val nick = EksiHtmlParser.parseLoggedInNick(html)
         NetworkPageResult(
             data = detail,
@@ -108,7 +183,7 @@ class EksiNetworkDataSource(
     suspend fun fetchSingleEntry(entryId: Long): NetworkPageResult<TopicDetail> =
         withContext(Dispatchers.IO) {
             val url = "$BASE_URL/entry/$entryId"
-            val (html, finalUrl) = executeGet(url, ajax = false)
+            val (html, finalUrl) = executeGet(url, ajax = false, allowWebViewFallback = true)
             val detail = EksiHtmlParser.parseSingleEntryPage(html)
             val nick = EksiHtmlParser.parseLoggedInNick(html)
             NetworkPageResult(
@@ -127,7 +202,7 @@ class EksiNetworkDataSource(
         val cleanSlug = URLEncoder.encode(authorSlug.trim().removePrefix("@"), "UTF-8")
             .replace("+", "%20")
         val profileUrl = "$BASE_URL/biri/$cleanSlug"
-        val (profileHtml, finalUrl) = executeGet(profileUrl, ajax = false)
+        val (profileHtml, finalUrl) = executeGet(profileUrl, ajax = false, allowWebViewFallback = true)
         var profile = EksiHtmlParser.parseAuthorProfile(profileHtml, authorSlug, tab)
         val loggedInNick = EksiHtmlParser.parseLoggedInNick(profileHtml)
 
@@ -265,7 +340,7 @@ class EksiNetworkDataSource(
         withContext(Dispatchers.IO) {
             val encoded = URLEncoder.encode(query.trim(), "UTF-8")
             val url = "$BASE_URL/basliklar/ara?SearchForm.Keywords=$encoded&p=$page"
-            val (html, finalUrl) = executeGet(url, ajax = false)
+            val (html, finalUrl) = executeGet(url, ajax = false, allowWebViewFallback = true)
             // If Ekşi redirected straight to a topic page instead of a list:
             val listItems = EksiHtmlParser.parseTopicList(html, isDebe = false)
             val items = if (listItems.isNotEmpty()) {
@@ -296,43 +371,179 @@ class EksiNetworkDataSource(
     suspend fun toggleFavorite(
         entryId: Long,
         currentlyFavorited: Boolean,
-        verificationToken: String?
+        verificationToken: String?,
+        refererPath: String? = null
     ): Result<Int> = withContext(Dispatchers.IO) {
         runCatching {
-            val endpoint = if (currentlyFavorited) {
-                "$BASE_URL/entry/favsil"
-            } else {
-                "$BASE_URL/entry/favori"
-            }
-            val formBuilder = FormBody.Builder().add("entryId", entryId.toString())
-            if (!verificationToken.isNullOrBlank()) {
-                formBuilder.add("__RequestVerificationToken", verificationToken)
-            }
-            val request = Request.Builder()
-                .url(endpoint)
-                .post(formBuilder.build())
-                .header("User-Agent", USER_AGENT)
-                .header("X-Requested-With", "XMLHttpRequest")
-                .header("Accept", "application/json, text/javascript, */*; q=0.01")
-                .header("Referer", "$BASE_URL/entry/$entryId")
-                .build()
+            val resolvedReferer = refererPath
+                ?.takeIf { it.isNotBlank() }
+                ?.let {
+                    val norm = EksiHtmlParser.normalizePath(it)
+                    if (norm.startsWith("http")) norm else "$BASE_URL$norm"
+                }
+                ?: "$BASE_URL/entry/$entryId"
 
-            client.newCall(request).execute().use { resp ->
-                if (resp.code == 401 || resp.code == 403) {
-                    throw IllegalStateException("Bu işlem için Ekşi Sözlük hesabınızla giriş yapmalısınız.")
-                }
-                val body = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    throw IOException("İşlem başarısız (${resp.code})")
-                }
-                val json = runCatching { JSONObject(body) }.getOrNull()
-                if (json != null && json.has("Count")) {
-                    json.optInt("Count", 0)
-                } else {
-                    if (currentlyFavorited) -1 else 1
+            var activeToken = verificationToken?.takeIf { it.isNotBlank() }
+            if (activeToken == null) {
+                activeToken = fetchEntryVerificationToken(entryId)
+            }
+
+            val candidatePaths = if (currentlyFavorited) {
+                listOf("/entry/favsil", "/entry/favlama", "/entry/removefavorite")
+            } else {
+                listOf("/entry/favori", "/entry/favla", "/entry/addfavorite")
+            }
+
+            var lastError: Throwable? = null
+            var refreshedTokenTried = false
+
+            for (path in candidatePaths) {
+                var attempt = 0
+                while (attempt < 2) {
+                    attempt++
+                    val endpoint = "$BASE_URL$path"
+                    val formBuilder = FormBody.Builder()
+                        .add("entryId", entryId.toString())
+                    if (!activeToken.isNullOrBlank()) {
+                        formBuilder.add("__RequestVerificationToken", activeToken)
+                    }
+
+                    val request = Request.Builder()
+                        .url(endpoint)
+                        .post(formBuilder.build())
+                        .header("User-Agent", USER_AGENT)
+                        .header("X-Requested-With", "XMLHttpRequest")
+                        .header("Accept", "application/json, text/javascript, */*; q=0.01")
+                        .header("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
+                        .header("Origin", BASE_URL)
+                        .header("Referer", resolvedReferer)
+                        .build()
+
+                    val outcome = client.newCall(request).execute().use { resp ->
+                        val finalUrl = resp.request.url.toString()
+                        val body = resp.body?.string().orEmpty()
+                        val isCfHeader = resp.header("cf-mitigated") != null
+                        val isCfBody = (resp.code == 403 || resp.code == 503) &&
+                            (body.contains("Just a moment", ignoreCase = true) ||
+                                body.contains("cf-browser-verification", ignoreCase = true) ||
+                                body.contains("Attention Required", ignoreCase = true) ||
+                                isCfHeader)
+                        if (isCfBody) {
+                            throw CloudflareChallengeException(finalUrl)
+                        }
+
+                        if (resp.code == 401 ||
+                            finalUrl.contains("/giris", ignoreCase = true) ||
+                            body.contains("form[action*=/giris]", ignoreCase = true) ||
+                            body.contains("action=\"/giris\"", ignoreCase = true)
+                        ) {
+                            throw IllegalStateException("Bu işlem için Ekşi Sözlük hesabınızla giriş yapmalısınız.")
+                        }
+
+                        // Parse JSON response if present (both success and error responses)
+                        val trimmed = body.trimStart()
+                        if (trimmed.startsWith("{")) {
+                            val json = runCatching { JSONObject(trimmed) }.getOrNull()
+                            if (json != null) {
+                                val explicitFail = (json.has("Success") && !json.optBoolean("Success", true)) ||
+                                    (json.has("success") && !json.optBoolean("success", true)) ||
+                                    (json.has("IsSuccessful") && !json.optBoolean("IsSuccessful", true)) ||
+                                    (json.has("isSuccessful") && !json.optBoolean("isSuccessful", true))
+                                if (explicitFail || !resp.isSuccessful) {
+                                    val msg = json.optString("Message")
+                                        .ifBlank { json.optString("message") }
+                                        .ifBlank { json.optString("ErrorMessage") }
+                                        .ifBlank { json.optString("error") }
+                                    if (msg.isNotBlank()) {
+                                        throw IllegalStateException(msg)
+                                    }
+                                } else {
+                                    val count = when {
+                                        json.has("Count") -> json.optInt("Count", -1)
+                                        json.has("count") -> json.optInt("count", -1)
+                                        json.has("FavoriteCount") -> json.optInt("FavoriteCount", -1)
+                                        json.has("favoriteCount") -> json.optInt("favoriteCount", -1)
+                                        else -> -1
+                                    }
+                                    return@use FavoriteCallOutcome.Success(count)
+                                }
+                            }
+                        }
+
+                        if (resp.isSuccessful) {
+                            return@use FavoriteCallOutcome.Success(-1)
+                        }
+
+                        if (resp.code == 403) {
+                            throw IllegalStateException("Bu işlem için Ekşi Sözlük hesabınızla giriş yapmalısınız.")
+                        }
+
+                        // Retry once with a fresh token on 400/500 if we haven't refreshed yet
+                        if ((resp.code == 400 || resp.code == 500) && !refreshedTokenTried) {
+                            refreshedTokenTried = true
+                            val fresh = fetchEntryVerificationToken(entryId)
+                            if (!fresh.isNullOrBlank() && fresh != activeToken) {
+                                activeToken = fresh
+                                return@use FavoriteCallOutcome.RetrySameEndpoint
+                            }
+                        }
+
+                        val htmlErr = EksiHtmlParser.parsePostEntryError(body)
+                        val err = IllegalStateException(
+                            htmlErr?.takeIf { it.isNotBlank() } ?: "İşlem başarısız (${resp.code})"
+                        )
+                        if (resp.code == 404 || resp.code == 405) {
+                            return@use FavoriteCallOutcome.TryNextEndpoint(err)
+                        }
+                        throw err
+                    }
+
+                    when (outcome) {
+                        is FavoriteCallOutcome.Success -> return@runCatching outcome.count
+                        is FavoriteCallOutcome.RetrySameEndpoint -> continue
+                        is FavoriteCallOutcome.TryNextEndpoint -> {
+                            lastError = outcome.error
+                            break
+                        }
+                    }
                 }
             }
+
+            throw (lastError ?: IOException("Favori işlemi başarısız."))
         }
+    }
+
+    private suspend fun fetchEntryVerificationToken(entryId: Long): String? {
+        return runCatching {
+            val (html, finalUrl) = executeGet("$BASE_URL/entry/$entryId", ajax = false)
+            if (finalUrl.contains("/giris", ignoreCase = true)) {
+                throw IllegalStateException("Bu işlem için Ekşi Sözlük hesabınızla giriş yapmalısınız.")
+            }
+            val doc = org.jsoup.Jsoup.parse(html, BASE_URL)
+            if (doc.selectFirst("form[action*=/giris]") != null) {
+                throw IllegalStateException("Bu işlem için Ekşi Sözlük hesabınızla giriş yapmalısınız.")
+            }
+            doc.selectFirst("input[name=__RequestVerificationToken]")
+                ?.attr("value")
+                ?.takeIf { it.isNotBlank() }
+                ?: doc.selectFirst("meta[name=csrf-token], meta[name=__RequestVerificationToken]")
+                    ?.attr("content")
+                    ?.takeIf { it.isNotBlank() }
+        }.getOrElse { err ->
+            if (err is kotlinx.coroutines.CancellationException ||
+                err is CloudflareChallengeException ||
+                err is IllegalStateException
+            ) {
+                throw err
+            }
+            null
+        }
+    }
+
+    private sealed interface FavoriteCallOutcome {
+        data class Success(val count: Int) : FavoriteCallOutcome
+        data object RetrySameEndpoint : FavoriteCallOutcome
+        data class TryNextEndpoint(val error: Throwable) : FavoriteCallOutcome
     }
 
     suspend fun checkLoggedInUser(): String? = withContext(Dispatchers.IO) {
@@ -502,17 +713,26 @@ class EksiNetworkDataSource(
         body: String,
         formMeta: com.example.data.model.MessageFormMeta?,
         refererPath: String = "/mesaj"
-    ): Result<String> = withContext(Dispatchers.IO) {
+    ): Result<com.example.data.model.SendMessageOutcome> = withContext(Dispatchers.IO) {
         runCatching {
             var resolvedForm = formMeta
 
             if (resolvedForm == null || resolvedForm.fields["__RequestVerificationToken"].isNullOrBlank()) {
-                val targetFormUrl = if (refererPath.startsWith("http")) refererPath else "$BASE_URL${EksiHtmlParser.normalizePath(refererPath)}"
+                val targetFormUrl = if (refererPath.startsWith("http")) {
+                    refererPath
+                } else {
+                    "$BASE_URL${EksiHtmlParser.normalizePath(refererPath)}"
+                }
                 val (freshHtml, freshUrl) = executeGet(targetFormUrl, ajax = false)
                 if (freshUrl.contains("/giris")) {
                     throw IllegalStateException("Mesaj göndermek için Ekşi Sözlük hesabınızla giriş yapmalısınız.")
                 }
-                val parsed = EksiHtmlParser.extractMessageFormMeta(org.jsoup.Jsoup.parse(freshHtml, BASE_URL))
+                val fallbackPath = EksiHtmlParser.normalizePath(freshUrl)
+                    .ifBlank { EksiHtmlParser.normalizePath(refererPath) }
+                val parsed = EksiHtmlParser.extractMessageFormMeta(
+                    doc = org.jsoup.Jsoup.parse(freshHtml, BASE_URL),
+                    fallbackAction = fallbackPath
+                )
                 if (parsed != null) {
                     resolvedForm = parsed
                 } else if (refererPath != "/mesaj/yeni") {
@@ -520,7 +740,10 @@ class EksiNetworkDataSource(
                     if (yeniUrl.contains("/giris")) {
                         throw IllegalStateException("Mesaj göndermek için Ekşi Sözlük hesabınızla giriş yapmalısınız.")
                     }
-                    resolvedForm = EksiHtmlParser.extractMessageFormMeta(org.jsoup.Jsoup.parse(yeniHtml, BASE_URL))
+                    resolvedForm = EksiHtmlParser.extractMessageFormMeta(
+                        doc = org.jsoup.Jsoup.parse(yeniHtml, BASE_URL),
+                        fallbackAction = "/mesaj/yeni"
+                    )
                 }
             }
 
@@ -533,7 +756,11 @@ class EksiNetworkDataSource(
 
             val merged = LinkedHashMap<String, String>()
             merged.putAll(meta.fields)
-            if (!toNick.isNullOrBlank()) {
+            val existingRecipient = merged[meta.recipientFieldName]
+            if (!toNick.isNullOrBlank() &&
+                existingRecipient.isNullOrBlank() &&
+                (meta.hasRecipientInput || actionPath.contains("/yeni", ignoreCase = true))
+            ) {
                 merged[meta.recipientFieldName] = toNick.trim().removePrefix("@")
             }
             merged[meta.bodyFieldName] = body
@@ -541,8 +768,12 @@ class EksiNetworkDataSource(
             val formBuilder = FormBody.Builder()
             merged.forEach { (k, v) -> formBuilder.add(k, v) }
 
-            val referer = if (refererPath.startsWith("http")) refererPath else "$BASE_URL${EksiHtmlParser.normalizePath(refererPath)}"
-            val request = Request.Builder()
+            val referer = if (refererPath.startsWith("http")) {
+                refererPath
+            } else {
+                "$BASE_URL${EksiHtmlParser.normalizePath(refererPath)}"
+            }
+            val requestBuilder = Request.Builder()
                 .url(postUrl)
                 .post(formBuilder.build())
                 .header("User-Agent", USER_AGENT)
@@ -550,11 +781,24 @@ class EksiNetworkDataSource(
                 .header("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
                 .header("Origin", BASE_URL)
                 .header("Referer", referer)
-                .build()
 
-            client.newCall(request).execute().use { resp ->
+            if (meta.isAjax) {
+                requestBuilder.header("X-Requested-With", "XMLHttpRequest")
+            }
+
+            client.newCall(requestBuilder.build()).execute().use { resp ->
                 val finalUrl = resp.request.url.toString()
                 val respBody = resp.body?.string().orEmpty()
+
+                val isCfHeader = resp.header("cf-mitigated") != null
+                val isCfBody = (resp.code == 403 || resp.code == 503) &&
+                    (respBody.contains("Just a moment", ignoreCase = true) ||
+                        respBody.contains("cf-browser-verification", ignoreCase = true) ||
+                        respBody.contains("Attention Required", ignoreCase = true) ||
+                        isCfHeader)
+                if (isCfBody) {
+                    throw CloudflareChallengeException(finalUrl)
+                }
 
                 if (resp.code == 401 || resp.code == 403 || finalUrl.contains("/giris")) {
                     throw IllegalStateException("Oturumunuz açık değil veya doğrulama gerekiyor.")
@@ -563,19 +807,23 @@ class EksiNetworkDataSource(
                 if (respBody.trimStart().startsWith("{")) {
                     val json = runCatching { JSONObject(respBody) }.getOrNull()
                     if (json != null) {
-                        val success = json.optBoolean("Success", false)
+                        val success = json.optBoolean("Success", json.optBoolean("success", false))
                         if (!success) {
-                            val msg = json.optString("Message").ifBlank {
-                                json.optString("ErrorMessage").ifBlank { "Mesaj gönderilemedi." }
-                            }
+                            val msg = json.optString("Message")
+                                .ifBlank { json.optString("message") }
+                                .ifBlank { json.optString("ErrorMessage") }
+                                .ifBlank { json.optString("error") }
+                                .ifBlank { "Mesaj gönderilemedi." }
                             throw IllegalStateException(msg)
                         }
-                        return@use json.optString("RedirectUrl").ifBlank { refererPath }
+                        val redirectUrl = json.optString("RedirectUrl")
+                            .ifBlank { json.optString("redirectUrl") }
+                            .ifBlank { refererPath }
+                        return@use com.example.data.model.SendMessageOutcome(
+                            redirectPath = EksiHtmlParser.normalizePath(redirectUrl).ifBlank { refererPath },
+                            responseHtml = ""
+                        )
                     }
-                }
-
-                if (!resp.isSuccessful && respBody.isBlank()) {
-                    throw IOException("Mesaj gönderilemedi (HTTP ${resp.code})")
                 }
 
                 val parsedError = EksiHtmlParser.parsePostEntryError(respBody)
@@ -583,44 +831,671 @@ class EksiNetworkDataSource(
                     throw IllegalStateException(parsedError)
                 }
 
-                EksiHtmlParser.normalizePath(finalUrl).ifBlank { refererPath }
+                if (!resp.isSuccessful) {
+                    throw IOException("Mesaj gönderilemedi (HTTP ${resp.code})")
+                }
+
+                com.example.data.model.SendMessageOutcome(
+                    redirectPath = EksiHtmlParser.normalizePath(finalUrl).ifBlank { refererPath },
+                    responseHtml = respBody
+                )
             }
         }
     }
 
+    @Volatile
+    private var cachedScriptMessageEndpoints: List<String>? = null
+
+    suspend fun deleteMessageThread(
+        threadUrl: String,
+        threadId: String,
+        deleteMeta: com.example.data.model.MessageDeleteMeta?,
+        fallbackToken: String?
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val normalizedThreadPath = EksiHtmlParser.normalizePath(threadUrl)
+            val threadFullUrl = if (normalizedThreadPath.startsWith("http")) {
+                normalizedThreadPath
+            } else {
+                "$BASE_URL$normalizedThreadPath"
+            }
+            var discoveredId = threadId.trim()
+            var meaningfulError: Throwable? = null
+            var last404Error: Throwable? = null
+            var cfError: CloudflareChallengeException? = null
+
+            fun recordOutcomeError(err: Throwable) {
+                when {
+                    err is CloudflareChallengeException -> cfError = err
+                    err.message?.contains("404") == true -> last404Error = err
+                    else -> meaningfulError = err
+                }
+            }
+
+            // Stage 1: try pre-parsed inbox delete metadata directly if token is already present
+            if (deleteMeta != null && !deleteMeta.fields["__RequestVerificationToken"].isNullOrBlank()) {
+                val stage1Token = deleteMeta.fields["__RequestVerificationToken"]
+                val stage1Candidates = listOf(
+                    DeleteCandidate(deleteMeta.action, deleteMeta.fields, deleteMeta.isAjax, "POST", isJsonBody = false),
+                    DeleteCandidate(deleteMeta.action, deleteMeta.fields, !deleteMeta.isAjax, "POST", isJsonBody = false),
+                    DeleteCandidate(deleteMeta.action, deleteMeta.fields, isAjax = true, method = "POST", isJsonBody = true)
+                ).distinctBy { "${it.action}|${it.isAjax}|${it.isJsonBody}" }
+                for (candidate in stage1Candidates) {
+                    when (
+                        val outcome = executeDeleteCandidate(
+                            candidate = candidate,
+                            refererUrl = "$BASE_URL/mesaj",
+                            normalizedThreadPath = normalizedThreadPath,
+                            threadId = discoveredId,
+                            fallbackToken = stage1Token
+                        )
+                    ) {
+                        DeleteCallOutcome.Success -> return@withContext Result.success(Unit)
+                        is DeleteCallOutcome.RetryNext -> recordOutcomeError(outcome.error)
+                    }
+                }
+            }
+
+            // Stage 2: always fetch live thread page (and /mesaj if needed) for fresh token, real numeric ID, and script/form endpoints
+            val stage2Get = runCatching {
+                executeGet(
+                    url = threadFullUrl,
+                    ajax = false,
+                    referer = "$BASE_URL/mesaj"
+                )
+            }.onFailure { err ->
+                if (err is kotlinx.coroutines.CancellationException) throw err
+                recordOutcomeError(err)
+            }.getOrNull()
+
+            var resolvedTargetUrl = threadFullUrl
+            var resolvedPathForFallback = normalizedThreadPath
+
+            if (stage2Get != null) {
+                val (threadHtml, finalThreadUrl) = stage2Get
+                if (finalThreadUrl.contains("/giris", ignoreCase = true)) {
+                    return@withContext Result.failure(
+                        IllegalStateException("Mesaj silmek için Ekşi Sözlük hesabınızla giriş yapmalısınız.")
+                    )
+                }
+                val refererUrl = finalThreadUrl.ifBlank { threadFullUrl }
+                resolvedTargetUrl = refererUrl
+                val resolvedThreadPath = EksiHtmlParser.normalizePath(finalThreadUrl)
+                    .takeIf { it.startsWith("/mesaj/") }
+                    ?: normalizedThreadPath
+                resolvedPathForFallback = resolvedThreadPath
+                val threadDoc = org.jsoup.Jsoup.parse(threadHtml, BASE_URL)
+                val finalUrlTail = resolvedThreadPath.substringBefore("?").trimEnd('/').substringAfterLast("/").trim()
+                val idSeed = finalUrlTail.takeIf { it.toLongOrNull()?.let { n -> n > 0L } == true } ?: discoveredId
+                discoveredId = EksiHtmlParser.extractThreadIdFromDocument(threadDoc, idSeed)
+
+                val maxMessageId = extractMaxMessageIdFromDocument(threadDoc)
+
+                val parsedFromThread = EksiHtmlParser.extractMessageDeleteMetaFromPage(
+                    doc = threadDoc,
+                    threadId = discoveredId
+                )
+                val threadScriptEndpoints = EksiHtmlParser.extractDeleteEndpointsFromHtml(threadHtml)
+
+                var pageToken = parsedFromThread?.fields?.get("__RequestVerificationToken")?.takeIf { it.isNotBlank() }
+                    ?: threadDoc.selectFirst("input[name=__RequestVerificationToken]")
+                        ?.attr("value")
+                        ?.takeIf { it.isNotBlank() }
+                    ?: threadDoc.selectFirst("meta[name=csrf-token], meta[name=__RequestVerificationToken]")
+                        ?.attr("content")
+                        ?.takeIf { it.isNotBlank() }
+
+                var inboxDoc: org.jsoup.nodes.Document? = null
+                var inboxMeta: com.example.data.model.MessageDeleteMeta? = null
+                var inboxScriptEndpoints: List<String> = emptyList()
+                if (pageToken.isNullOrBlank() || parsedFromThread == null) {
+                    runCatching {
+                        val (inboxHtml, _) = executeGet("$BASE_URL/mesaj", ajax = false, referer = refererUrl)
+                        val parsedInboxDoc = org.jsoup.Jsoup.parse(inboxHtml, BASE_URL)
+                        inboxDoc = parsedInboxDoc
+                        if (pageToken.isNullOrBlank()) {
+                            pageToken = parsedInboxDoc.selectFirst("input[name=__RequestVerificationToken]")
+                                ?.attr("value")
+                                ?.takeIf { it.isNotBlank() }
+                                ?: parsedInboxDoc.selectFirst("meta[name=csrf-token], meta[name=__RequestVerificationToken]")
+                                    ?.attr("content")
+                                    ?.takeIf { it.isNotBlank() }
+                        }
+                        inboxMeta = EksiHtmlParser.extractMessageDeleteMetaFromPage(parsedInboxDoc, discoveredId)
+                        inboxScriptEndpoints = EksiHtmlParser.extractDeleteEndpointsFromHtml(inboxHtml)
+                    }.onFailure { err ->
+                        if (err is kotlinx.coroutines.CancellationException) throw err
+                    }
+                }
+
+                val jsBundleEndpoints = discoverMessageDeleteEndpointsFromScripts(
+                    listOfNotNull(threadDoc, inboxDoc)
+                )
+
+                val resolvedToken = pageToken?.takeIf { it.isNotBlank() }
+                    ?: fallbackToken?.takeIf { it.isNotBlank() }
+                    ?: deleteMeta?.fields?.get("__RequestVerificationToken")?.takeIf { it.isNotBlank() }
+
+                val extraEndpoints = (
+                    listOfNotNull(parsedFromThread?.action, inboxMeta?.action, deleteMeta?.action) +
+                        threadScriptEndpoints +
+                        inboxScriptEndpoints +
+                        jsBundleEndpoints
+                    ).distinct()
+
+                val baseMeta = parsedFromThread ?: inboxMeta ?: deleteMeta
+                val primaryFields = LinkedHashMap<String, String>().apply {
+                    baseMeta?.fields?.let { putAll(it) }
+                    if (!resolvedToken.isNullOrBlank()) {
+                        put("__RequestVerificationToken", resolvedToken)
+                    }
+                }
+                val stage2Primary = com.example.data.model.MessageDeleteMeta(
+                    action = baseMeta?.action ?: extraEndpoints.firstOrNull() ?: "/mesaj/sil",
+                    fields = primaryFields,
+                    isAjax = baseMeta?.isAjax ?: true
+                )
+
+                val stage2Candidates = buildDeleteCandidates(
+                    primary = stage2Primary,
+                    threadId = discoveredId,
+                    normalizedThreadPath = resolvedThreadPath,
+                    extraEndpoints = extraEndpoints,
+                    maxMessageId = maxMessageId
+                )
+                for (candidate in stage2Candidates) {
+                    when (
+                        val outcome = executeDeleteCandidate(
+                            candidate = candidate,
+                            refererUrl = refererUrl,
+                            normalizedThreadPath = resolvedThreadPath,
+                            threadId = discoveredId,
+                            fallbackToken = resolvedToken
+                        )
+                    ) {
+                        DeleteCallOutcome.Success -> return@withContext Result.success(Unit)
+                        is DeleteCallOutcome.RetryNext -> recordOutcomeError(outcome.error)
+                    }
+                }
+            }
+
+            // Stage 3a: check if one of the HTTP calls actually deleted the thread on server despite non-2xx/redirect quirk
+            if (verifyThreadDeletedFromInbox(resolvedPathForFallback, discoveredId)) {
+                return@withContext Result.success(Unit)
+            }
+
+            // Hand off to window-attached WebThreadDeleteDialog (avoids headless WebView renderer crashes)
+            val errMsg = (cfError ?: meaningfulError ?: last404Error)?.message ?: "Mesaj silinemedi."
+            Result.failure(
+                WebDeleteFallbackException(
+                    targetUrl = resolvedTargetUrl,
+                    threadId = discoveredId,
+                    threadPath = resolvedPathForFallback,
+                    message = errMsg
+                )
+            )
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Result.failure(t)
+        }
+    }
+
+    private fun extractMaxMessageIdFromDocument(doc: org.jsoup.nodes.Document): Long? {
+        val attrMax = doc.select(
+            "#message-thread [data-id], .message-thread [data-id], ul.message-list [data-id], " +
+                "li.incoming[data-id], li.outgoing[data-id], article[data-id], [data-message-id]"
+        ).mapNotNull { el ->
+            el.attr("data-message-id").ifBlank { el.attr("data-id") }
+                .trim()
+                .toLongOrNull()
+                ?.takeIf { it > 0L }
+        }.maxOrNull()
+        if (attrMax != null) return attrMax
+
+        val html = doc.html()
+        return Regex("""(?:maxMessageId|lastMessageId|MaxMessageId)\s*[:=]\s*['"]?(\d+)['"]?""")
+            .find(html)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toLongOrNull()
+            ?.takeIf { it > 0L }
+    }
+
+    suspend fun verifyThreadDeleted(
+        threadUrl: String,
+        threadId: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        val normalized = EksiHtmlParser.normalizePath(threadUrl)
+        verifyThreadDeletedFromInbox(normalized, threadId)
+    }
+
+    private fun discoverMessageDeleteEndpointsFromScripts(docs: List<org.jsoup.nodes.Document>): List<String> {
+        cachedScriptMessageEndpoints?.let { return it }
+        val scriptUrls = docs.flatMap { doc ->
+            doc.select("script[src]").mapNotNull { el ->
+                val abs = el.absUrl("src").ifBlank { el.attr("src").trim() }
+                when {
+                    abs.startsWith("https://") || abs.startsWith("http://") -> abs
+                    abs.startsWith("//") -> "https:$abs"
+                    abs.startsWith("/") -> "$BASE_URL$abs"
+                    else -> null
+                }
+            }
+        }.filter { url ->
+            val lower = url.lowercase()
+            (lower.contains("eksisozluk.com") || lower.contains("ekstat.com")) &&
+                !lower.contains("gtag") &&
+                !lower.contains("analytics") &&
+                !lower.contains("ads") &&
+                !lower.contains("doubleclick")
+        }.distinct()
+            .sortedByDescending { u ->
+                val l = u.lowercase()
+                when {
+                    l.contains("mesaj") || l.contains("message") -> 3
+                    l.contains("app") || l.contains("main") || l.contains("site") || l.contains("bundle") || l.contains("eks") -> 2
+                    else -> 1
+                }
+            }
+            .take(8)
+
+        if (scriptUrls.isEmpty()) return emptyList()
+
+        val found = LinkedHashSet<String>()
+        var anySucceeded = false
+        for (jsUrl in scriptUrls) {
+            runCatching {
+                val req = Request.Builder()
+                    .url(jsUrl)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Accept", "*/*")
+                    .header("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
+                    .header("Referer", "$BASE_URL/mesaj")
+                    .header("Sec-Ch-Ua", "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
+                    .header("Sec-Ch-Ua-Mobile", "?1")
+                    .header("Sec-Ch-Ua-Platform", "\"Android\"")
+                    .header("Sec-Fetch-Dest", "script")
+                    .header("Sec-Fetch-Mode", "no-cors")
+                    .header("Sec-Fetch-Site", "same-site")
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        anySucceeded = true
+                        val jsBody = resp.body?.string().orEmpty()
+                        found.addAll(EksiHtmlParser.extractDeleteEndpointsFromHtml(jsBody))
+                    }
+                }
+            }
+        }
+        val list = found.toList()
+        if (anySucceeded) {
+            cachedScriptMessageEndpoints = list
+        }
+        return list
+    }
+
+    private suspend fun verifyThreadDeletedFromInbox(
+        normalizedThreadPath: String,
+        threadId: String
+    ): Boolean {
+        val inbox = runCatching { fetchMessageInbox(archived = false).data }.getOrNull() ?: return false
+        if (inbox.requiresLogin) return false
+        val cleanTargetPath = normalizedThreadPath.substringBefore("?").trimEnd('/')
+        val cleanId = threadId.trim()
+        val stillPresent = inbox.threads.any { item ->
+            val itemPath = EksiHtmlParser.normalizePath(item.threadUrl).substringBefore("?").trimEnd('/')
+            (cleanTargetPath.isNotBlank() && itemPath.equals(cleanTargetPath, ignoreCase = true)) ||
+                (cleanId.isNotBlank() && item.threadId.trim() == cleanId)
+        }
+        return !stillPresent
+    }
+
+    private fun executeDeleteCandidate(
+        candidate: DeleteCandidate,
+        refererUrl: String,
+        normalizedThreadPath: String,
+        threadId: String,
+        fallbackToken: String? = null
+    ): DeleteCallOutcome {
+        val actionPath = EksiHtmlParser.normalizePath(candidate.action).ifBlank { "/mesaj/sil" }
+        val targetUrl = if (actionPath.startsWith("http")) actionPath else "$BASE_URL$actionPath"
+
+        val requestBuilder = Request.Builder()
+            .url(targetUrl)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "application/json, text/javascript, */*; q=0.01, text/html; q=0.8")
+            .header("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
+            .header("Origin", BASE_URL)
+            .header("Referer", refererUrl)
+            .header("Sec-Ch-Ua", "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
+            .header("Sec-Ch-Ua-Mobile", "?1")
+            .header("Sec-Ch-Ua-Platform", "\"Android\"")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-Mode", if (candidate.isAjax) "cors" else "navigate")
+            .header("Sec-Fetch-Dest", if (candidate.isAjax) "empty" else "document")
+
+        fun buildJsonPayload(): okhttp3.RequestBody {
+            candidate.rawJsonBody?.let { raw ->
+                return raw.toRequestBody("application/json; charset=utf-8".toMediaType())
+            }
+            val json = JSONObject()
+            candidate.fields.forEach { (k, v) ->
+                if (k == "__RequestVerificationToken") return@forEach
+                val numeric = v.toLongOrNull()
+                if (numeric != null && numeric > 0L) {
+                    json.put(k, numeric)
+                } else {
+                    json.put(k, v)
+                }
+            }
+            return json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+        }
+
+        when (candidate.method) {
+            "GET" -> requestBuilder.get()
+            "DELETE" -> {
+                if (candidate.isJsonBody && (candidate.rawJsonBody != null || candidate.fields.any { it.key != "__RequestVerificationToken" })) {
+                    requestBuilder.delete(buildJsonPayload())
+                } else {
+                    requestBuilder.delete()
+                }
+            }
+            else -> {
+                if (candidate.isJsonBody) {
+                    requestBuilder.post(buildJsonPayload())
+                } else {
+                    val formBuilder = FormBody.Builder()
+                    candidate.fields.forEach { (k, v) -> formBuilder.add(k, v) }
+                    requestBuilder.post(formBuilder.build())
+                }
+            }
+        }
+
+        if (candidate.isAjax) {
+            requestBuilder.header("X-Requested-With", "XMLHttpRequest")
+        }
+        val token = candidate.fields["__RequestVerificationToken"]?.takeIf { it.isNotBlank() }
+            ?: fallbackToken?.takeIf { it.isNotBlank() }
+        if (!token.isNullOrBlank() && (candidate.isAjax || candidate.isJsonBody || candidate.method == "DELETE")) {
+            requestBuilder.header("RequestVerificationToken", token)
+            requestBuilder.header("X-RequestVerificationToken", token)
+            requestBuilder.header("X-CSRF-TOKEN", token)
+        }
+
+        return client.newCall(requestBuilder.build()).execute().use { resp ->
+            val finalUrl = resp.request.url.toString()
+            val respBody = resp.body?.string().orEmpty()
+
+            val isCfHeader = resp.header("cf-mitigated") != null
+            val isCfBody = (resp.code == 403 || resp.code == 503) &&
+                (respBody.contains("Just a moment", ignoreCase = true) ||
+                    respBody.contains("cf-browser-verification", ignoreCase = true) ||
+                    respBody.contains("Attention Required", ignoreCase = true) ||
+                    isCfHeader)
+            if (isCfBody) {
+                return@use DeleteCallOutcome.RetryNext(CloudflareChallengeException(finalUrl))
+            }
+
+            if (resp.code == 401 || finalUrl.contains("/giris", ignoreCase = true)) {
+                throw IllegalStateException("Oturumunuz açık değil veya doğrulama gerekiyor.")
+            }
+
+            val trimmed = respBody.trimStart()
+            if (trimmed.startsWith("{")) {
+                val json = runCatching { JSONObject(trimmed) }.getOrNull()
+                if (json != null) {
+                    val explicitFail = (json.has("Success") && !json.optBoolean("Success", true)) ||
+                        (json.has("success") && !json.optBoolean("success", true)) ||
+                        (json.has("IsSuccessful") && !json.optBoolean("IsSuccessful", true)) ||
+                        (json.has("isSuccessful") && !json.optBoolean("isSuccessful", true)) ||
+                        (json.has("Result") && !json.optBoolean("Result", true)) ||
+                        (json.has("result") && !json.optBoolean("result", true))
+                    if (explicitFail || !resp.isSuccessful) {
+                        val msg = json.optString("Message")
+                            .ifBlank { json.optString("message") }
+                            .ifBlank { json.optString("ErrorMessage") }
+                            .ifBlank { json.optString("error") }
+                            .ifBlank { "Mesaj silinemedi." }
+                        return@use DeleteCallOutcome.RetryNext(IllegalStateException(msg))
+                    }
+                    return@use DeleteCallOutcome.Success
+                }
+            }
+
+            val parsedError = EksiHtmlParser.parsePostEntryError(respBody)
+            if (!parsedError.isNullOrBlank()) {
+                return@use DeleteCallOutcome.RetryNext(IllegalStateException(parsedError))
+            }
+
+            if (resp.isSuccessful) {
+                // If POST redirected to inbox HTML, verify the thread wasn't silently retained
+                val finalPath = EksiHtmlParser.normalizePath(finalUrl).substringBefore("?").trimEnd('/')
+                if (finalPath == "/mesaj" || respBody.contains("message-thread-list") || respBody.contains("id=\"threads\"")) {
+                    val inbox = runCatching { EksiHtmlParser.parseMessageInbox(respBody, finalUrl) }.getOrNull()
+                    if (inbox != null && !inbox.requiresLogin) {
+                        val cleanTarget = normalizedThreadPath.substringBefore("?").trimEnd('/')
+                        val cleanId = threadId.trim()
+                        val stillThere = inbox.threads.any { item ->
+                            val itemPath = EksiHtmlParser.normalizePath(item.threadUrl).substringBefore("?").trimEnd('/')
+                            (cleanTarget.isNotBlank() && itemPath.equals(cleanTarget, ignoreCase = true)) ||
+                                (cleanId.isNotBlank() && item.threadId.trim() == cleanId)
+                        }
+                        if (stillThere) {
+                            return@use DeleteCallOutcome.RetryNext(IOException("Mesaj silinemedi."))
+                        }
+                    }
+                }
+                return@use DeleteCallOutcome.Success
+            }
+
+            if (resp.code == 403) {
+                return@use DeleteCallOutcome.RetryNext(
+                    IllegalStateException("Oturumunuz açık değil veya doğrulama gerekiyor.")
+                )
+            }
+
+            val err = IOException("Mesaj silinemedi (HTTP ${resp.code})")
+            if (resp.code == 400 || resp.code == 404 || resp.code == 405 || resp.code == 415 || resp.code == 500) {
+                DeleteCallOutcome.RetryNext(err)
+            } else {
+                throw err
+            }
+        }
+    }
+
+    private fun buildDeleteCandidates(
+        primary: com.example.data.model.MessageDeleteMeta,
+        threadId: String,
+        normalizedThreadPath: String,
+        extraEndpoints: List<String>,
+        maxMessageId: Long? = null
+    ): List<DeleteCandidate> {
+        val list = mutableListOf<DeleteCandidate>()
+        val token = primary.fields["__RequestVerificationToken"].orEmpty()
+        val cleanId = threadId.trim().takeIf { it.isNotBlank() && it != "0" }.orEmpty()
+        val cleanThreadPath = normalizedThreadPath.substringBefore("?").trimEnd('/')
+        val pathTail = cleanThreadPath.substringAfterLast("/").trim()
+            .takeIf { it.isNotBlank() && it != "0" && !it.equals("mesaj", ignoreCase = true) }
+            .orEmpty()
+        val candidateIds = listOf(cleanId, pathTail).filter { it.isNotBlank() }.distinct()
+        val preferredId = candidateIds.firstOrNull().orEmpty()
+
+        val primaryFields = LinkedHashMap<String, String>().apply {
+            putAll(primary.fields)
+            val hasId = keys.any {
+                val k = it.lowercase()
+                k == "id" || k == "threadid" || k == "konusmaid" || k == "messageid" || k == "threadids"
+            }
+            if (!hasId && preferredId.isNotBlank() && !primary.action.contains("/$preferredId")) {
+                put("id", preferredId)
+            }
+        }
+        list.add(DeleteCandidate(primary.action, primaryFields, primary.isAjax, "POST", isJsonBody = false))
+        list.add(DeleteCandidate(primary.action, primaryFields, true, "POST", isJsonBody = true))
+
+        val idForFastProbe = preferredId
+        if (idForFastProbe.isNotBlank()) {
+            val numericId = idForFastProbe.toLongOrNull()?.takeIf { it > 0L }
+            val threadListJson = if (numericId != null) {
+                val item = JSONObject().apply {
+                    put("ThreadId", numericId)
+                    if (maxMessageId != null) put("MaxMessageId", maxMessageId)
+                }
+                JSONObject().put("ThreadIdList", org.json.JSONArray().put(item)).toString()
+            } else {
+                null
+            }
+
+            // 1. Discovered endpoints from HTML/JS bundles first
+            val discoveredActions = extraEndpoints.flatMap { rawAct ->
+                val norm = EksiHtmlParser.normalizePath(rawAct)
+                when {
+                    norm.endsWith("/") -> listOf("$norm$idForFastProbe", norm.trimEnd('/'))
+                    norm.endsWith("=") -> listOf("$norm$idForFastProbe")
+                    else -> listOf(norm)
+                }
+            }.filter { it.isNotBlank() }.distinct()
+
+            for (act in discoveredActions) {
+                if (act.contains("/$idForFastProbe") || act.contains("=$idForFastProbe")) {
+                    val tokenOnly = LinkedHashMap<String, String>().apply {
+                        if (token.isNotBlank()) put("__RequestVerificationToken", token)
+                    }
+                    list.add(DeleteCandidate(act, tokenOnly, isAjax = true, method = "POST", isJsonBody = false))
+                    list.add(DeleteCandidate(act, tokenOnly, isAjax = true, method = "DELETE", isJsonBody = false))
+                } else {
+                    val idFields = LinkedHashMap<String, String>().apply {
+                        if (token.isNotBlank()) put("__RequestVerificationToken", token)
+                        put("id", idForFastProbe)
+                    }
+                    val threadFields = LinkedHashMap<String, String>().apply {
+                        if (token.isNotBlank()) put("__RequestVerificationToken", token)
+                        put("threadId", idForFastProbe)
+                        if (maxMessageId != null) put("maxMessageId", maxMessageId.toString())
+                    }
+                    list.add(DeleteCandidate(act, idFields, isAjax = true, method = "POST", isJsonBody = false))
+                    list.add(DeleteCandidate(act, threadFields, isAjax = true, method = "POST", isJsonBody = false))
+                    list.add(DeleteCandidate(act, threadFields, isAjax = true, method = "POST", isJsonBody = true))
+                    if (threadListJson != null) {
+                        list.add(DeleteCandidate(act, idFields, isAjax = true, method = "POST", isJsonBody = true, rawJsonBody = threadListJson))
+                    }
+                }
+            }
+
+            // 2. Concise high-probability fallback endpoints (fast ~2s probe before WebView fallback)
+            val fallbackRoutes = listOf(
+                "/mesaj/sil",
+                "/mesaj/konusma/sil",
+                "/mesaj/deleteprocessthread",
+                "/mesaj/deletethread"
+            )
+            for (route in fallbackRoutes) {
+                val idFields = LinkedHashMap<String, String>().apply {
+                    if (token.isNotBlank()) put("__RequestVerificationToken", token)
+                    put("id", idForFastProbe)
+                }
+                val threadFields = LinkedHashMap<String, String>().apply {
+                    if (token.isNotBlank()) put("__RequestVerificationToken", token)
+                    put("threadId", idForFastProbe)
+                    if (maxMessageId != null) put("maxMessageId", maxMessageId.toString())
+                }
+                list.add(DeleteCandidate(route, idFields, isAjax = true, method = "POST", isJsonBody = false))
+                list.add(DeleteCandidate(route, threadFields, isAjax = true, method = "POST", isJsonBody = true))
+                if (threadListJson != null && route.contains("process", ignoreCase = true)) {
+                    list.add(DeleteCandidate(route, idFields, isAjax = true, method = "POST", isJsonBody = true, rawJsonBody = threadListJson))
+                }
+            }
+
+            // 3. Direct path-ID & DELETE probe
+            val tokenOnly = LinkedHashMap<String, String>().apply {
+                if (token.isNotBlank()) put("__RequestVerificationToken", token)
+            }
+            list.add(DeleteCandidate("/mesaj/sil/$idForFastProbe", tokenOnly, isAjax = true, method = "POST", isJsonBody = false))
+            if (cleanThreadPath.startsWith("/mesaj/") && !cleanThreadPath.equals("/mesaj/yeni", ignoreCase = true)) {
+                list.add(DeleteCandidate(cleanThreadPath, tokenOnly, isAjax = true, method = "DELETE", isJsonBody = false))
+            }
+        }
+
+        return list.distinctBy {
+            "${it.method}|${it.action}|${it.isAjax}|${it.isJsonBody}|${it.rawJsonBody}|${it.fields.entries.joinToString()}"
+        }.take(24)
+    }
+
+    private data class DeleteCandidate(
+        val action: String,
+        val fields: Map<String, String>,
+        val isAjax: Boolean,
+        val method: String = "POST",
+        val isJsonBody: Boolean = false,
+        val rawJsonBody: String? = null
+    )
+
+    private sealed interface DeleteCallOutcome {
+        data object Success : DeleteCallOutcome
+        data class RetryNext(val error: Throwable) : DeleteCallOutcome
+    }
+
     fun buildTopicUrl(slugOrUrl: String, page: Int, filter: TopicFilter): String {
-        val clean = slugOrUrl.trim()
+        val clean = slugOrUrl.trim().substringBefore("#")
         val base = when {
             clean.startsWith("http://") || clean.startsWith("https://") -> clean
             clean.startsWith("/") -> "$BASE_URL$clean"
             else -> "$BASE_URL/?q=${URLEncoder.encode(clean, "UTF-8")}"
         }
-        val withoutPage = base.replace(Regex("([?&])p=\\d+"), "$1")
-            .replace("?&", "?")
-            .trimEnd('?', '&')
+        val pathPart = base.substringBefore("?")
+        val queryPart = base.substringAfter("?", "")
+        val preservedParams = queryPart
+            .split("&")
+            .filter { pair ->
+                if (pair.isBlank()) return@filter false
+                val key = pair.substringBefore("=").lowercase()
+                key != "p" && key != "a"
+            }
 
-        val separator = if (withoutPage.contains("?")) "&" else "?"
-        val params = mutableListOf<String>()
-        if (page > 1) params.add("p=$page")
-        if (filter.queryParam != null && !withoutPage.contains("a=${filter.queryParam}")) {
-            params.add("a=${filter.queryParam}")
+        val allParams = preservedParams.toMutableList()
+        if (page > 1) {
+            allParams.add("p=$page")
         }
-        return if (params.isEmpty()) withoutPage else "$withoutPage$separator${params.joinToString("&")}"
+        filter.queryParam?.let { param ->
+            allParams.add("a=$param")
+        }
+
+        return if (allParams.isEmpty()) pathPart else "$pathPart?${allParams.joinToString("&")}"
     }
 
-    private fun executeGet(url: String, ajax: Boolean, referer: String = BASE_URL): Pair<String, String> {
+    private suspend fun executeGet(
+        url: String,
+        ajax: Boolean,
+        referer: String = BASE_URL,
+        @Suppress("UNUSED_PARAMETER") allowWebViewFallback: Boolean = false
+    ): Pair<String, String> {
         val builder = Request.Builder()
             .url(url)
             .header("User-Agent", USER_AGENT)
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .header("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
             .header("Referer", referer)
+            .header("Sec-Ch-Ua", "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
+            .header("Sec-Ch-Ua-Mobile", "?1")
+            .header("Sec-Ch-Ua-Platform", "\"Android\"")
 
         if (ajax) {
-            builder.header("X-Requested-With", "XMLHttpRequest")
+            builder
+                .header("Accept", "text/html, */*; q=0.01")
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header("Sec-Fetch-Dest", "empty")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Site", "same-origin")
+        } else {
+            builder
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+                .header("Upgrade-Insecure-Requests", "1")
+                .header("Sec-Fetch-Dest", "document")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Site", "same-origin")
         }
 
-        client.newCall(builder.build()).execute().use { response ->
+        val outcome = client.newCall(builder.build()).execute().use { response ->
             val finalUrl = response.request.url.toString()
             val body = response.body?.string().orEmpty()
             val isCfHeader = response.header("cf-mitigated") != null
@@ -630,13 +1505,18 @@ class EksiNetworkDataSource(
                     body.contains("Attention Required", ignoreCase = true) ||
                     isCfHeader)
 
-            if (isCfBody || response.code == 403) {
-                throw CloudflareChallengeException(finalUrl)
-            }
-            if (!response.isSuccessful && body.isBlank()) {
-                throw IOException("Sunucu yanıt vermedi (HTTP ${response.code})")
-            }
-            return body to finalUrl
+            Triple(response.code, response.isSuccessful, Triple(isCfBody || response.code == 403, body, finalUrl))
         }
+
+        val (httpCode, isSuccessful, payload) = outcome
+        val (needsCfFallback, body, finalUrl) = payload
+
+        if (needsCfFallback) {
+            throw CloudflareChallengeException(finalUrl)
+        }
+        if (!isSuccessful && body.isBlank()) {
+            throw IOException("Sunucu yanıt vermedi (HTTP $httpCode)")
+        }
+        return body to finalUrl
     }
 }

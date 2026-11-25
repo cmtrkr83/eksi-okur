@@ -5,7 +5,11 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.local.UserPreferences
 import com.example.data.model.MessageInboxData
 import com.example.data.model.MessageThreadDetail
+import com.example.data.model.MessageThreadSummary
 import com.example.data.model.UiResult
+import com.example.data.network.CloudflareChallengeException
+import com.example.data.network.EksiHtmlParser
+import com.example.data.network.WebDeleteFallbackException
 import com.example.data.repository.EksiRepository
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -16,6 +20,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+
+data class WebDeleteThreadRequest(
+    val thread: MessageThreadSummary,
+    val targetUrl: String,
+    val threadId: String,
+    val threadPath: String
+)
 
 data class MessagesUiState(
     val showArchived: Boolean = false,
@@ -31,6 +42,10 @@ data class MessagesUiState(
     val threadResult: UiResult<MessageThreadDetail> = UiResult.Loading,
     val isSendingReply: Boolean = false,
     val replyError: String? = null,
+    val replyChallengeUrl: String? = null,
+    val deletingThreadIds: Set<String> = emptySet(),
+    val deleteChallengeUrl: String? = null,
+    val pendingWebDelete: WebDeleteThreadRequest? = null,
     val actionMessage: String? = null
 )
 
@@ -142,7 +157,7 @@ class MessagesViewModel(
                 formMeta = formMeta,
                 refererPath = "/mesaj/yeni"
             )
-            result.onSuccess { redirectPath ->
+            result.onSuccess { outcome ->
                 _uiState.update {
                     it.copy(
                         isSendingNewMessage = false,
@@ -154,11 +169,8 @@ class MessagesViewModel(
                     )
                 }
                 loadInbox()
-                if (redirectPath.startsWith("/mesaj/") &&
-                    redirectPath != "/mesaj/yeni" &&
-                    redirectPath != "/mesaj/arsiv"
-                ) {
-                    onThreadRedirect?.invoke(redirectPath)
+                if (isSpecificThreadPath(outcome.redirectPath)) {
+                    onThreadRedirect?.invoke(outcome.redirectPath)
                 }
             }.onFailure { err ->
                 _uiState.update {
@@ -181,7 +193,8 @@ class MessagesViewModel(
                         activeThreadUrl = threadUrl,
                         isRefreshingThread = false,
                         threadResult = UiResult.Loading,
-                        replyError = null
+                        replyError = null,
+                        replyChallengeUrl = null
                     )
                 }
             }
@@ -202,23 +215,88 @@ class MessagesViewModel(
         val trimmedBody = body.trim()
         if (trimmedBody.isEmpty()) return
 
+        val participantNick = detail?.participantNick?.takeIf {
+            it.isNotBlank() && !it.equals("Sohbet", ignoreCase = true)
+        }
+
         viewModelScope.launch {
-            _uiState.update { it.copy(isSendingReply = true, replyError = null) }
+            _uiState.update {
+                it.copy(
+                    isSendingReply = true,
+                    replyError = null,
+                    replyChallengeUrl = null
+                )
+            }
             val res = repository.sendMessage(
-                toNick = detail?.participantNick,
+                toNick = participantNick,
                 body = trimmedBody,
                 formMeta = detail?.replyForm,
                 refererPath = threadUrl
             )
-            res.onSuccess {
-                _uiState.update { it.copy(isSendingReply = false, replyError = null) }
-                loadThread(threadUrl, isPullRefresh = true)
+            res.onSuccess { outcome ->
+                val targetUrl = if (isSpecificThreadPath(outcome.redirectPath)) {
+                    outcome.redirectPath
+                } else {
+                    threadUrl
+                }
+                val currentNick = preferences.value.loggedInNick
+                val parsedImmediate = if (outcome.responseHtml.isNotBlank()) {
+                    runCatching {
+                        EksiHtmlParser.parseMessageThread(
+                            html = outcome.responseHtml,
+                            requestedUrl = targetUrl,
+                            currentUserNick = currentNick
+                        )
+                    }.getOrNull()
+                } else null
+
+                if (parsedImmediate?.requiresLogin == true) {
+                    _uiState.update {
+                        it.copy(
+                            isSendingReply = false,
+                            replyError = "Oturumunuz sona ermiş görünüyor. Lütfen tekrar giriş yapın."
+                        )
+                    }
+                    return@onSuccess
+                }
+
+                if (parsedImmediate != null && parsedImmediate.messages.isNotEmpty()) {
+                    _uiState.update {
+                        it.copy(
+                            activeThreadUrl = targetUrl,
+                            isSendingReply = false,
+                            replyError = null,
+                            replyChallengeUrl = null,
+                            threadResult = UiResult.Success(
+                                parsedImmediate.copy(
+                                    replyForm = parsedImmediate.replyForm ?: detail?.replyForm
+                                )
+                            )
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            activeThreadUrl = targetUrl,
+                            isSendingReply = false,
+                            replyError = null,
+                            replyChallengeUrl = null
+                        )
+                    }
+                }
+                loadThread(targetUrl, isPullRefresh = true)
                 loadInbox(isPullRefresh = true)
             }.onFailure { err ->
+                val cfUrl = (err as? CloudflareChallengeException)?.challengeUrl
                 _uiState.update {
                     it.copy(
                         isSendingReply = false,
-                        replyError = err.message ?: "Yanıt gönderilemedi."
+                        replyError = if (cfUrl != null) {
+                            "Yanıt göndermek için güvenlik doğrulaması gerekiyor."
+                        } else {
+                            err.message ?: "Yanıt gönderilemedi."
+                        },
+                        replyChallengeUrl = cfUrl
                     )
                 }
             }
@@ -233,7 +311,179 @@ class MessagesViewModel(
         }
     }
 
+    fun deleteThread(
+        thread: MessageThreadSummary,
+        onDeleted: (() -> Unit)? = null
+    ) {
+        if (thread.threadId in _uiState.value.deletingThreadIds) return
+
+        val inboxSuccess = (_uiState.value.inboxResult as? UiResult.Success)?.data
+        val fallbackToken = inboxSuccess?.verificationToken
+            ?: inboxSuccess?.composeForm?.fields?.get("__RequestVerificationToken")
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    deletingThreadIds = it.deletingThreadIds + thread.threadId,
+                    deleteChallengeUrl = null
+                )
+            }
+            val result = repository.deleteMessageThread(
+                threadUrl = thread.threadUrl,
+                threadId = thread.threadId,
+                deleteMeta = thread.deleteMeta,
+                fallbackToken = fallbackToken
+            )
+            result.onSuccess {
+                _uiState.update { current ->
+                    val currentInbox = current.inboxResult as? UiResult.Success
+                    val updatedInbox = if (currentInbox != null) {
+                        UiResult.Success(
+                            data = currentInbox.data.copy(
+                                threads = currentInbox.data.threads.filterNot {
+                                    it.threadId == thread.threadId && it.threadUrl == thread.threadUrl
+                                }
+                            ),
+                            isFromCache = currentInbox.isFromCache,
+                            cachedAtMillis = currentInbox.cachedAtMillis
+                        )
+                    } else {
+                        current.inboxResult
+                    }
+                    val clearedActive = if (current.activeThreadUrl == thread.threadUrl) null else current.activeThreadUrl
+                    current.copy(
+                        deletingThreadIds = current.deletingThreadIds - thread.threadId,
+                        inboxResult = updatedInbox,
+                        activeThreadUrl = clearedActive,
+                        actionMessage = "@${thread.participantNick} ile olan mesaj silindi"
+                    )
+                }
+                onDeleted?.invoke()
+                loadInbox(isPullRefresh = true)
+            }.onFailure { err ->
+                when (err) {
+                    is WebDeleteFallbackException -> {
+                        _uiState.update { current ->
+                            current.copy(
+                                deletingThreadIds = current.deletingThreadIds - thread.threadId,
+                                pendingWebDelete = WebDeleteThreadRequest(
+                                    thread = thread,
+                                    targetUrl = err.targetUrl,
+                                    threadId = err.threadId,
+                                    threadPath = err.threadPath
+                                )
+                            )
+                        }
+                    }
+                    is CloudflareChallengeException -> {
+                        val normalized = EksiHtmlParser.normalizePath(thread.threadUrl)
+                        val fullUrl = if (normalized.startsWith("http")) normalized else "https://eksisozluk.com$normalized"
+                        _uiState.update { current ->
+                            current.copy(
+                                deletingThreadIds = current.deletingThreadIds - thread.threadId,
+                                pendingWebDelete = WebDeleteThreadRequest(
+                                    thread = thread,
+                                    targetUrl = fullUrl,
+                                    threadId = thread.threadId,
+                                    threadPath = normalized
+                                )
+                            )
+                        }
+                    }
+                    else -> {
+                        _uiState.update { current ->
+                            current.copy(
+                                deletingThreadIds = current.deletingThreadIds - thread.threadId,
+                                actionMessage = err.message ?: "Mesaj silinemedi."
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun dismissWebThreadDelete() {
+        _uiState.update { it.copy(pendingWebDelete = null) }
+    }
+
+    fun onWebThreadDeleteCompleted(
+        request: WebDeleteThreadRequest,
+        onDeleted: (() -> Unit)? = null
+    ) {
+        _uiState.update { current ->
+            current.copy(
+                pendingWebDelete = null,
+                deletingThreadIds = current.deletingThreadIds + request.thread.threadId
+            )
+        }
+        viewModelScope.launch {
+            val isDeleted = repository.verifyMessageThreadDeleted(
+                threadUrl = request.threadPath,
+                threadId = request.thread.threadId
+            ) || (
+                request.threadId.isNotBlank() &&
+                    request.threadId != request.thread.threadId &&
+                    repository.verifyMessageThreadDeleted(
+                        threadUrl = request.threadPath,
+                        threadId = request.threadId
+                    )
+                )
+
+            if (isDeleted) {
+                _uiState.update { current ->
+                    val currentInbox = current.inboxResult as? UiResult.Success
+                    val updatedInbox = if (currentInbox != null) {
+                        UiResult.Success(
+                            data = currentInbox.data.copy(
+                                threads = currentInbox.data.threads.filterNot {
+                                    it.threadId == request.thread.threadId && it.threadUrl == request.thread.threadUrl
+                                }
+                            ),
+                            isFromCache = currentInbox.isFromCache,
+                            cachedAtMillis = currentInbox.cachedAtMillis
+                        )
+                    } else {
+                        current.inboxResult
+                    }
+                    val clearedActive = if (current.activeThreadUrl == request.thread.threadUrl) null else current.activeThreadUrl
+                    current.copy(
+                        deletingThreadIds = current.deletingThreadIds - request.thread.threadId,
+                        inboxResult = updatedInbox,
+                        activeThreadUrl = clearedActive,
+                        actionMessage = "@${request.thread.participantNick} ile olan mesaj silindi"
+                    )
+                }
+                onDeleted?.invoke()
+                loadInbox(isPullRefresh = true)
+            } else {
+                _uiState.update { current ->
+                    current.copy(
+                        deletingThreadIds = current.deletingThreadIds - request.thread.threadId,
+                        actionMessage = "Mesaj silinemedi. Sayfa içinden Sil'e basıp Tamamlandı ile onaylayabilirsiniz."
+                    )
+                }
+                loadInbox(isPullRefresh = true)
+            }
+        }
+    }
+
+    fun clearDeleteChallenge() {
+        _uiState.update { it.copy(deleteChallengeUrl = null) }
+    }
+
     fun clearActionMessage() {
         _uiState.update { it.copy(actionMessage = null) }
+    }
+
+    private fun isSpecificThreadPath(path: String): Boolean {
+        val clean = path.lowercase().substringBefore("?")
+        return clean.startsWith("/mesaj/") &&
+            clean != "/mesaj/" &&
+            clean != "/mesaj/yeni" &&
+            clean != "/mesaj/arsiv" &&
+            clean != "/mesaj/sil" &&
+            clean != "/mesaj/ara" &&
+            clean != "/mesaj/send"
     }
 }

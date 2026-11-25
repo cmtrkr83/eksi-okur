@@ -258,4 +258,273 @@ class EksiHtmlParserTest {
         assertEquals("replyTok", detail.replyForm?.fields?.get("__RequestVerificationToken"))
         assertEquals("9001", detail.replyForm?.fields?.get("ThreadId"))
     }
+
+    @Test
+    fun parseMessageThread_ignoresArchiveDeleteFormsAndPreservesFallbackAction() {
+        val threadHtml = """
+            <html><body>
+                <h1 id="title"><a href="/biri/ssg">ssg</a> ile mesajlaşma</h1>
+                <form action="/mesaj/arsiv" method="post">
+                    <input type="hidden" name="__RequestVerificationToken" value="archiveTok" />
+                    <button type="submit">arşivle</button>
+                </form>
+                <form action="/mesaj/sil" method="post">
+                    <input type="hidden" name="__RequestVerificationToken" value="delTok" />
+                    <button type="submit">sil</button>
+                </form>
+                <div id="message-thread">
+                    <article class="incoming" data-id="m10" data-author="ssg">
+                        <p class="message-body">merhaba</p>
+                        <time>21:00</time>
+                    </article>
+                </div>
+                <form method="post" data-ajax="true">
+                    <input type="hidden" name="__RequestVerificationToken" value="realReplyTok" />
+                    <input type="hidden" name="ThreadId" value="42" />
+                    <textarea name="Body"></textarea>
+                </form>
+            </body></html>
+        """.trimIndent()
+
+        val detail = EksiHtmlParser.parseMessageThread(threadHtml, "/mesaj/42", "benimnick")
+        assertEquals("ssg", detail.participantNick)
+        assertEquals(1, detail.messages.size)
+        assertEquals("/mesaj/42", detail.replyForm?.action)
+        assertEquals("realReplyTok", detail.replyForm?.fields?.get("__RequestVerificationToken"))
+        assertEquals("42", detail.replyForm?.fields?.get("ThreadId"))
+        assertEquals("Body", detail.replyForm?.bodyFieldName)
+        assertEquals(false, detail.replyForm?.hasRecipientInput)
+        assertEquals(true, detail.replyForm?.isAjax)
+    }
+
+    @Test
+    fun parseMessageInbox_andThread_extractsDeleteMeta() {
+        val inboxHtml = """
+            <html><body>
+                <ul id="threads">
+                    <li data-id="5551">
+                        <a href="/mesaj/5551">
+                            <h2>yazar1</h2>
+                            <p class="preview">son mesaj</p>
+                            <time>24.11.2026</time>
+                        </a>
+                        <form action="/mesaj/sil" method="post" data-ajax="true">
+                            <input type="hidden" name="__RequestVerificationToken" value="delInboxTok" />
+                            <input type="hidden" name="threadId" value="5551" />
+                            <button type="submit">sil</button>
+                        </form>
+                    </li>
+                </ul>
+            </body></html>
+        """.trimIndent()
+
+        val inbox = EksiHtmlParser.parseMessageInbox(inboxHtml, "https://eksisozluk.com/mesaj")
+        assertEquals(1, inbox.threads.size)
+        assertEquals("son mesaj", inbox.threads[0].preview)
+        assertEquals("/mesaj/sil", inbox.threads[0].deleteMeta?.action)
+        assertEquals("delInboxTok", inbox.threads[0].deleteMeta?.fields?.get("__RequestVerificationToken"))
+        assertEquals("5551", inbox.threads[0].deleteMeta?.fields?.get("threadId"))
+        assertEquals(true, inbox.threads[0].deleteMeta?.isAjax)
+
+        val threadDoc = org.jsoup.Jsoup.parse(
+            """
+            <html><body>
+                <input type="hidden" name="__RequestVerificationToken" value="pageTok99" />
+                <a class="delete-message" data-url="/mesaj/sil" data-id="777">sil</a>
+            </body></html>
+            """.trimIndent(),
+            "https://eksisozluk.com"
+        )
+        val threadDelete = EksiHtmlParser.extractMessageDeleteMetaFromPage(threadDoc, "777")
+        assertEquals("/mesaj/sil", threadDelete?.action)
+        assertEquals("pageTok99", threadDelete?.fields?.get("__RequestVerificationToken"))
+        assertEquals("777", threadDelete?.fields?.get("id"))
+        assertEquals(true, threadDelete?.isAjax)
+    }
+
+    @Test
+    fun parseMessageInbox_supportsPageLevelBulkDeleteFormAndTrailingSlashUrl() {
+        val inboxHtml = """
+            <html><body>
+                <form action="/mesaj/sil" method="post" data-ajax="true">
+                    <input type="hidden" name="__RequestVerificationToken" value="bulkTok" />
+                    <ul id="threads">
+                        <li>
+                            <input type="checkbox" name="threadIds" value="8812" />
+                            <a href="/mesaj/8812/">
+                                <h2>ssg</h2>
+                                <p class="preview">deneme</p>
+                            </a>
+                        </li>
+                    </ul>
+                    <button type="submit">sil</button>
+                </form>
+            </body></html>
+        """.trimIndent()
+
+        val inbox = EksiHtmlParser.parseMessageInbox(inboxHtml, "https://eksisozluk.com/mesaj")
+        assertEquals(1, inbox.threads.size)
+        assertEquals("8812", inbox.threads[0].threadId)
+        assertEquals("/mesaj/sil", inbox.threads[0].deleteMeta?.action)
+        assertEquals("bulkTok", inbox.threads[0].deleteMeta?.fields?.get("__RequestVerificationToken"))
+        assertEquals("8812", inbox.threads[0].deleteMeta?.fields?.get("threadIds"))
+    }
+
+    @Test
+    fun buildTopicUrl_handlesFilterAndPageParamsConsistently() {
+        val ds = com.example.data.network.EksiNetworkDataSource(
+            com.example.data.network.WebViewCookieJar()
+        )
+        assertEquals(
+            "https://eksisozluk.com/yapay-zeka--12345?p=10&a=popular",
+            ds.buildTopicUrl("/yapay-zeka--12345?a=popular", 10, TopicFilter.POPULAR)
+        )
+        assertEquals(
+            "https://eksisozluk.com/yapay-zeka--12345?p=400",
+            ds.buildTopicUrl("/yapay-zeka--12345?a=popular", 400, TopicFilter.ALL)
+        )
+        assertEquals(
+            "https://eksisozluk.com/yapay-zeka--12345?p=3&a=nice",
+            ds.buildTopicUrl("/yapay-zeka--12345?a=popular&p=1", 3, TopicFilter.SUKELA)
+        )
+        assertEquals(
+            "https://eksisozluk.com/?q=deneme&p=2&a=dailynice",
+            ds.buildTopicUrl("/?q=deneme&a=popular", 2, TopicFilter.DAILY_SUKELA)
+        )
+    }
+
+    @Test
+    fun parseTopicDetail_extractsPagerFallbacksAndFormattedCounts() {
+        val htmlWithLastLinkAndZeroAttr = """
+            <html><body>
+                <h1 id="title" data-id="900"><a href="/uzun-baslik--900"><span itemprop="name">uzun başlık</span></a></h1>
+                <div class="pager" data-currentpage="0" data-pagecount="0">
+                    <a class="last" href="/uzun-baslik--900?p=1234">1.234</a>
+                </div>
+                <ul id="entry-item-list">
+                    <li data-id="5001" data-author="yazar">
+                        <div class="content">test</div>
+                        <a class="entry-date" href="/entry/5001">24.11.2026</a>
+                        <a class="entry-author" href="/biri/yazar">yazar</a>
+                    </li>
+                </ul>
+            </body></html>
+        """.trimIndent()
+
+        val detail1 = EksiHtmlParser.parseTopicDetail(
+            htmlWithLastLinkAndZeroAttr,
+            "/uzun-baslik--900?p=7",
+            TopicFilter.ALL
+        )
+        assertEquals(7, detail1.currentPage)
+        assertEquals(1234, detail1.totalPages)
+
+        val htmlWithSelectFallback = """
+            <html><body>
+                <h1 id="title" data-id="901"><a href="/diger--901"><span itemprop="name">diğer</span></a></h1>
+                <div class="pager">
+                    <select>
+                        <option value="1">1</option>
+                        <option value="2" selected="selected">2</option>
+                        <option value="42">42</option>
+                    </select>
+                </div>
+                <ul id="entry-item-list">
+                    <li data-id="5002" data-author="yazar">
+                        <div class="content">test 2</div>
+                        <a class="entry-date" href="/entry/5002">24.11.2026</a>
+                        <a class="entry-author" href="/biri/yazar">yazar</a>
+                    </li>
+                </ul>
+            </body></html>
+        """.trimIndent()
+
+        val detail2 = EksiHtmlParser.parseTopicDetail(
+            htmlWithSelectFallback,
+            "/diger--901?p=2",
+            TopicFilter.POPULAR
+        )
+        assertEquals(2, detail2.currentPage)
+        assertEquals(42, detail2.totalPages)
+        assertEquals(TopicFilter.POPULAR, detail2.filter)
+    }
+
+    @Test
+    fun parseMessageDelete_extractsKonusmaSilFormsThreadIdsAndScriptEndpoints() {
+        val html = """
+            <html><body>
+                <form action="/mesaj/konusma/sil" method="post" data-ajax="false">
+                    <input type="hidden" name="__RequestVerificationToken" value="tokKonusma" />
+                    <button type="submit" name="cmd" value="remove">konuşmayı sil</button>
+                </form>
+                <script>
+                    var konusmaId = 987654;
+                    $.post("/mesaj/konusma/sil", { id: konusmaId });
+                </script>
+            </body></html>
+        """.trimIndent()
+        val doc = org.jsoup.Jsoup.parse(html, "https://eksisozluk.com")
+
+        val discoveredId = EksiHtmlParser.extractThreadIdFromDocument(doc, "ssg")
+        assertEquals("987654", discoveredId)
+
+        val meta = EksiHtmlParser.extractMessageDeleteMetaFromPage(doc, "ssg")
+        assertEquals("/mesaj/konusma/sil", meta?.action)
+        assertEquals("tokKonusma", meta?.fields?.get("__RequestVerificationToken"))
+        assertEquals("987654", meta?.fields?.get("id"))
+        assertEquals("remove", meta?.fields?.get("cmd"))
+        assertEquals(false, meta?.isAjax)
+
+        val scriptEndpoints = EksiHtmlParser.extractDeleteEndpointsFromHtml(html)
+        assertTrue(scriptEndpoints.contains("/mesaj/konusma/sil"))
+
+        val relativeDoc = org.jsoup.Jsoup.parse(
+            """
+            <html><body>
+                <form action="konusmasil" method="post">
+                    <input type="hidden" name="__RequestVerificationToken" value="relTok" />
+                    <button type="submit" title="Konuşmayı sil"></button>
+                </form>
+            </body></html>
+            """.trimIndent(),
+            "https://eksisozluk.com/mesaj"
+        )
+        val relMeta = EksiHtmlParser.extractMessageDeleteMetaFromPage(relativeDoc, "4321")
+        assertEquals("/mesaj/konusmasil", relMeta?.action)
+        assertEquals("relTok", relMeta?.fields?.get("__RequestVerificationToken"))
+        assertEquals("4321", relMeta?.fields?.get("id"))
+    }
+
+    @Test
+    fun parseMessageDelete_ignoresZeroAndHeaderInputsAndExtractsBacktickAndApiEndpoints() {
+        val htmlWithHeaderNoise = """
+            <html><body>
+                <header>
+                    <form action="/arama"><input type="hidden" name="id" value="0" /></form>
+                    <button data-id="99999">header btn</button>
+                </header>
+                <section id="content-body">
+                    <form action="/mesaj/konusma/sil" method="post">
+                        <input type="hidden" name="id" value="0" />
+                        <input type="hidden" name="threadId" value="445566" />
+                    </form>
+                </section>
+                <script>
+                    const url1 = `/mesaj/sil/${'$'}{threadId}`;
+                    const url2 = "https://www.eksisozluk.com/api/mesaj/sil";
+                </script>
+            </body></html>
+        """.trimIndent()
+        val doc = org.jsoup.Jsoup.parse(htmlWithHeaderNoise, "https://eksisozluk.com")
+
+        val extractedId = EksiHtmlParser.extractThreadIdFromDocument(doc, "ssg")
+        assertEquals("445566", extractedId)
+
+        val endpoints = EksiHtmlParser.extractDeleteEndpointsFromHtml(htmlWithHeaderNoise)
+        assertTrue(endpoints.contains("/mesaj/sil/"))
+        assertTrue(endpoints.contains("/api/mesaj/sil"))
+
+        assertEquals("/mesaj/sil", EksiHtmlParser.normalizePath("https://www.eksisozluk.com/mesaj/sil"))
+        assertEquals("/mesaj/sil", EksiHtmlParser.normalizePath("//m.eksisozluk.com/mesaj/sil"))
+    }
 }

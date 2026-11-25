@@ -7,8 +7,10 @@ import com.example.data.model.EntryItem
 import com.example.data.model.TopicDetail
 import com.example.data.model.TopicFilter
 import com.example.data.model.UiResult
+import com.example.data.network.CloudflareChallengeException
 import com.example.data.repository.EksiRepository
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -22,22 +24,31 @@ import kotlinx.coroutines.launch
 
 data class TopicUiState(
     val requestedSlugOrUrl: String = "",
+    val canonicalSlug: String? = null,
     val singleEntryId: Long? = null,
     val currentPage: Int = 1,
     val filter: TopicFilter = TopicFilter.ALL,
     val isRefreshing: Boolean = false,
+    val isAppendingNextPage: Boolean = false,
+    val appendError: String? = null,
+    val appendChallengeUrl: String? = null,
+    val scrollToTopTrigger: Int = 0,
     val result: UiResult<TopicDetail> = UiResult.Loading,
     val actionMessage: String? = null,
+    val actionChallengeUrl: String? = null,
     val isComposeOpen: Boolean = false,
     val isSubmittingEntry: Boolean = false,
     val submitEntryError: String? = null,
-    val showLoginPromptForEntry: Boolean = false
+    val loginPromptMessage: String? = null,
+    val pendingComposeAfterLogin: Boolean = false
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class TopicViewModel(
     private val repository: EksiRepository
 ) : ViewModel() {
+
+    private var appendJob: Job? = null
 
     private val _uiState = MutableStateFlow(TopicUiState())
     val uiState: StateFlow<TopicUiState> = _uiState.asStateFlow()
@@ -60,13 +71,21 @@ class TopicViewModel(
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
-    fun loadTopic(slugOrUrl: String, page: Int = 1, filter: TopicFilter = TopicFilter.ALL) {
+    fun loadTopic(slugOrUrl: String, page: Int = 1, filter: TopicFilter? = null) {
+        val resolvedFilter = filter ?: inferFilterFromUrl(slugOrUrl)
+        val resolvedPage = if (page > 1) page else (inferPageFromUrl(slugOrUrl) ?: 1)
+        appendJob?.cancel()
         _uiState.update {
             it.copy(
                 requestedSlugOrUrl = slugOrUrl,
+                canonicalSlug = null,
                 singleEntryId = null,
-                currentPage = page.coerceAtLeast(1),
-                filter = filter,
+                currentPage = resolvedPage.coerceAtLeast(1),
+                filter = resolvedFilter,
+                isAppendingNextPage = false,
+                appendError = null,
+                appendChallengeUrl = null,
+                scrollToTopTrigger = it.scrollToTopTrigger + 1,
                 result = UiResult.Loading
             )
         }
@@ -74,12 +93,18 @@ class TopicViewModel(
     }
 
     fun loadSingleEntry(entryId: Long) {
+        appendJob?.cancel()
         _uiState.update {
             it.copy(
                 requestedSlugOrUrl = "/entry/$entryId",
+                canonicalSlug = null,
                 singleEntryId = entryId,
                 currentPage = 1,
                 filter = TopicFilter.ALL,
+                isAppendingNextPage = false,
+                appendError = null,
+                appendChallengeUrl = null,
+                scrollToTopTrigger = it.scrollToTopTrigger + 1,
                 result = UiResult.Loading
             )
         }
@@ -91,21 +116,131 @@ class TopicViewModel(
 
     fun selectFilter(filter: TopicFilter) {
         if (_uiState.value.filter == filter && _uiState.value.singleEntryId == null) return
-        val slug = currentCanonicalOrRequested()
-        loadTopic(slug, page = 1, filter = filter)
+        appendJob?.cancel()
+        _uiState.update {
+            it.copy(
+                singleEntryId = null,
+                currentPage = 1,
+                filter = filter,
+                isAppendingNextPage = false,
+                appendError = null,
+                appendChallengeUrl = null,
+                scrollToTopTrigger = it.scrollToTopTrigger + 1,
+                result = UiResult.Loading
+            )
+        }
+        fetchTopicInternal(isPullRefresh = false)
     }
 
     fun goToPage(page: Int) {
         val current = _uiState.value
         val detail = (current.result as? UiResult.Success)?.data
+            ?: (current.result as? UiResult.Error)?.cachedData
         val maxPage = detail?.totalPages ?: Int.MAX_VALUE
         val target = page.coerceIn(1, maxPage.coerceAtLeast(1))
         if (target == current.currentPage && current.singleEntryId == null) return
-        _uiState.update { it.copy(currentPage = target, singleEntryId = null) }
+        appendJob?.cancel()
+        _uiState.update {
+            it.copy(
+                currentPage = target,
+                singleEntryId = null,
+                isAppendingNextPage = false,
+                appendError = null,
+                appendChallengeUrl = null,
+                scrollToTopTrigger = it.scrollToTopTrigger + 1
+            )
+        }
         fetchTopicInternal(isPullRefresh = false)
     }
 
+    fun loadNextPage(forceRetry: Boolean = false) {
+        val current = _uiState.value
+        if (current.singleEntryId != null || current.isRefreshing || current.isAppendingNextPage) return
+        if (!forceRetry && current.appendError != null) return
+        val currentDetail = (current.result as? UiResult.Success)?.data ?: return
+        val nextPage = currentDetail.currentPage + 1
+        if (nextPage > currentDetail.totalPages) return
+        val slug = currentCanonicalOrRequested()
+        if (slug.isBlank()) return
+
+        val expectedRequested = current.requestedSlugOrUrl
+        val expectedFilter = current.filter
+        val expectedBasePage = currentDetail.currentPage
+
+        appendJob?.cancel()
+        appendJob = viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isAppendingNextPage = true,
+                    appendError = null,
+                    appendChallengeUrl = null
+                )
+            }
+            val res = repository.getTopic(
+                slugOrUrl = slug,
+                page = nextPage,
+                filter = expectedFilter
+            )
+            _uiState.update { latest ->
+                if (latest.requestedSlugOrUrl != expectedRequested ||
+                    latest.filter != expectedFilter ||
+                    latest.singleEntryId != null
+                ) {
+                    return@update latest
+                }
+                val latestSuccess = latest.result as? UiResult.Success ?: return@update latest
+                val latestDetail = latestSuccess.data
+                if (latestDetail.currentPage != expectedBasePage) {
+                    return@update latest.copy(isAppendingNextPage = false)
+                }
+                when (res) {
+                    is UiResult.Success -> {
+                        val incoming = res.data
+                        val mergedEntries = (latestDetail.entries + incoming.entries).distinctBy { it.id }
+                        val resolvedPage = incoming.currentPage.coerceAtLeast(1)
+                        val resolvedTotalPages = incoming.totalPages.coerceAtLeast(resolvedPage)
+                        val updatedDetail = latestDetail.copy(
+                            currentPage = resolvedPage,
+                            totalPages = resolvedTotalPages,
+                            entries = mergedEntries,
+                            verificationToken = incoming.verificationToken ?: latestDetail.verificationToken,
+                            entryFormAction = incoming.entryFormAction ?: latestDetail.entryFormAction,
+                            entryFormFields = incoming.entryFormFields.ifEmpty { latestDetail.entryFormFields }
+                        )
+                        latest.copy(
+                            currentPage = resolvedPage,
+                            isAppendingNextPage = false,
+                            appendError = null,
+                            appendChallengeUrl = null,
+                            result = UiResult.Success(
+                                data = updatedDetail,
+                                isFromCache = latestSuccess.isFromCache && res.isFromCache,
+                                cachedAtMillis = res.cachedAtMillis ?: latestSuccess.cachedAtMillis
+                            )
+                        )
+                    }
+                    is UiResult.Error -> {
+                        latest.copy(
+                            isAppendingNextPage = false,
+                            appendError = res.message,
+                            appendChallengeUrl = res.challengeUrl
+                        )
+                    }
+                    is UiResult.Loading -> latest.copy(isAppendingNextPage = false)
+                }
+            }
+        }
+    }
+
     fun refresh() {
+        appendJob?.cancel()
+        _uiState.update {
+            it.copy(
+                isAppendingNextPage = false,
+                appendError = null,
+                appendChallengeUrl = null
+            )
+        }
         val singleId = _uiState.value.singleEntryId
         if (singleId != null) {
             _uiState.update { it.copy(isRefreshing = true) }
@@ -125,9 +260,7 @@ class TopicViewModel(
 
     fun onWriteEntryClicked() {
         val detail = (_uiState.value.result as? UiResult.Success)?.data
-        val isLoggedIn = !preferences.value.loggedInNick.isNullOrBlank() ||
-            detail?.entryFormAction != null
-        if (isLoggedIn) {
+        if (detail?.entryFormAction != null) {
             _uiState.update { it.copy(isComposeOpen = true, submitEntryError = null) }
         } else {
             viewModelScope.launch {
@@ -135,14 +268,24 @@ class TopicViewModel(
                 if (detected != null) {
                     _uiState.update { it.copy(isComposeOpen = true, submitEntryError = null) }
                 } else {
-                    _uiState.update { it.copy(showLoginPromptForEntry = true) }
+                    _uiState.update {
+                        it.copy(
+                            loginPromptMessage = "Bu başlığa entry girebilmek için Ekşi Sözlük hesabınızla oturum açmalısınız.",
+                            pendingComposeAfterLogin = true
+                        )
+                    }
                 }
             }
         }
     }
 
     fun dismissLoginPrompt() {
-        _uiState.update { it.copy(showLoginPromptForEntry = false) }
+        _uiState.update {
+            it.copy(
+                loginPromptMessage = null,
+                pendingComposeAfterLogin = false
+            )
+        }
     }
 
     fun closeComposeSheet() {
@@ -150,10 +293,18 @@ class TopicViewModel(
         _uiState.update { it.copy(isComposeOpen = false, submitEntryError = null) }
     }
 
-    fun onWebAuthCompleted(detectedNick: String?, openComposeAfter: Boolean = false) {
+    fun onWebAuthCompleted(
+        detectedNick: String?,
+        openComposeAfter: Boolean = false,
+        retryAppendAfter: Boolean = false
+    ) {
         viewModelScope.launch {
             val nick = repository.refreshSessionUser(detectedNick)
-            refresh()
+            if (retryAppendAfter) {
+                loadNextPage(forceRetry = true)
+            } else {
+                refresh()
+            }
             if (openComposeAfter && nick != null) {
                 _uiState.update { it.copy(isComposeOpen = true, submitEntryError = null) }
             }
@@ -189,9 +340,19 @@ class TopicViewModel(
                         actionMessage = "Entry'niz yayınlandı!"
                     )
                 }
+                val targetPage = if (detail.filter == TopicFilter.ALL) {
+                    detail.totalPages.coerceAtLeast(1)
+                } else {
+                    val allFirstPage = repository.getTopic(
+                        slugOrUrl = detail.canonicalUrl,
+                        page = 1,
+                        filter = TopicFilter.ALL
+                    )
+                    (allFirstPage as? UiResult.Success)?.data?.totalPages?.coerceAtLeast(1) ?: 1
+                }
                 loadTopic(
                     slugOrUrl = detail.canonicalUrl,
-                    page = detail.totalPages.coerceAtLeast(1),
+                    page = targetPage,
                     filter = TopicFilter.ALL
                 )
             }.onFailure { err ->
@@ -247,12 +408,27 @@ class TopicViewModel(
     }
 
     fun toggleFavorite(entry: EntryItem) {
-        val detail = (_uiState.value.result as? UiResult.Success)?.data ?: return
+        val successDetail = (_uiState.value.result as? UiResult.Success)?.data
+        val cachedDetail = (_uiState.value.result as? UiResult.Error)?.cachedData
+        val detail = successDetail ?: cachedDetail ?: return
+        if (preferences.value.loggedInNick.isNullOrBlank() &&
+            detail.entryFormAction == null &&
+            !repository.hasSessionCookies()
+        ) {
+            _uiState.update {
+                it.copy(
+                    loginPromptMessage = "Entry'leri favorileyebilmek için Ekşi Sözlük hesabınızla oturum açmalısınız.",
+                    pendingComposeAfterLogin = false
+                )
+            }
+            return
+        }
         viewModelScope.launch {
             val res = repository.toggleFavorite(
                 entryId = entry.id,
                 currentlyFavorited = entry.isFavorited,
-                verificationToken = detail.verificationToken
+                verificationToken = detail.verificationToken,
+                refererPath = detail.canonicalUrl
             )
             res.onSuccess { newCount ->
                 val updatedEntries = detail.entries.map { item ->
@@ -262,31 +438,94 @@ class TopicViewModel(
                         item.copy(isFavorited = updatedFav, favoriteCount = resolvedCount)
                     } else item
                 }
-                _uiState.update {
-                    it.copy(result = UiResult.Success(detail.copy(entries = updatedEntries)))
+                val updatedDetail = detail.copy(entries = updatedEntries)
+                _uiState.update { state ->
+                    when (val currentRes = state.result) {
+                        is UiResult.Success -> state.copy(result = UiResult.Success(updatedDetail))
+                        is UiResult.Error -> state.copy(result = currentRes.copy(cachedData = updatedDetail))
+                        else -> state
+                    }
                 }
             }.onFailure { err ->
-                _uiState.update {
-                    it.copy(actionMessage = err.message ?: "Favori işlemi için giriş yapmalısınız.")
+                val cfUrl = (err as? CloudflareChallengeException)?.challengeUrl
+                val errMsg = err.message.orEmpty()
+                if (cfUrl == null && errMsg.contains("giriş", ignoreCase = true)) {
+                    _uiState.update {
+                        it.copy(
+                            loginPromptMessage = errMsg.ifBlank {
+                                "Favori işlemi için Ekşi Sözlük hesabınızla giriş yapmalısınız."
+                            },
+                            pendingComposeAfterLogin = false
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            actionMessage = if (cfUrl != null) {
+                                "Favori işlemi için güvenlik doğrulaması gerekiyor."
+                            } else {
+                                errMsg.ifBlank { "Favori işlemi için giriş yapmalısınız." }
+                            },
+                            actionChallengeUrl = cfUrl
+                        )
+                    }
                 }
             }
         }
     }
 
     fun clearMessage() {
-        _uiState.update { it.copy(actionMessage = null) }
+        _uiState.update { it.copy(actionMessage = null, actionChallengeUrl = null) }
     }
 
     private fun currentCanonicalOrRequested(): String {
-        val detail = (_uiState.value.result as? UiResult.Success)?.data
-            ?: (_uiState.value.result as? UiResult.Error)?.cachedData
-        return detail?.canonicalUrl?.takeIf { it.isNotBlank() } ?: _uiState.value.requestedSlugOrUrl
+        val state = _uiState.value
+        val detail = (state.result as? UiResult.Success)?.data
+            ?: (state.result as? UiResult.Error)?.cachedData
+        val fromDetail = detail?.canonicalUrl?.trim()
+            ?.takeIf { it.isNotBlank() && it != "/" && !it.equals("/entry", ignoreCase = true) }
+        val fromState = state.canonicalSlug?.trim()
+            ?.takeIf { it.isNotBlank() && it != "/" && !it.equals("/entry", ignoreCase = true) }
+        return fromDetail ?: fromState ?: state.requestedSlugOrUrl
+    }
+
+    private fun inferFilterFromUrl(slugOrUrl: String): TopicFilter {
+        val query = slugOrUrl.substringAfter("?", "")
+        if (query.isBlank()) return TopicFilter.ALL
+        val aValue = query.split("&")
+            .firstOrNull { it.startsWith("a=", ignoreCase = true) }
+            ?.substringAfter("=")
+            ?.substringBefore("#")
+            ?.lowercase()
+        return when (aValue) {
+            "popular" -> TopicFilter.POPULAR
+            "nice" -> TopicFilter.SUKELA
+            "dailynice" -> TopicFilter.DAILY_SUKELA
+            else -> TopicFilter.ALL
+        }
+    }
+
+    private fun inferPageFromUrl(slugOrUrl: String): Int? {
+        val query = slugOrUrl.substringAfter("?", "")
+        if (query.isBlank()) return null
+        return query.split("&")
+            .firstOrNull { it.startsWith("p=", ignoreCase = true) }
+            ?.substringAfter("=")
+            ?.substringBefore("#")
+            ?.toIntOrNull()
+            ?.takeIf { it > 0 }
     }
 
     private fun fetchTopicInternal(isPullRefresh: Boolean) {
+        appendJob?.cancel()
         viewModelScope.launch {
             val current = _uiState.value
-            if (current.requestedSlugOrUrl.isBlank()) return@launch
+            val slugToFetch = currentCanonicalOrRequested()
+            if (slugToFetch.isBlank()) return@launch
+
+            val expectedRequested = current.requestedSlugOrUrl
+            val expectedPage = current.currentPage
+            val expectedFilter = current.filter
 
             _uiState.update {
                 if (isPullRefresh) it.copy(isRefreshing = true)
@@ -294,16 +533,29 @@ class TopicViewModel(
             }
 
             val res = repository.getTopic(
-                slugOrUrl = current.requestedSlugOrUrl,
-                page = current.currentPage,
-                filter = current.filter
+                slugOrUrl = slugToFetch,
+                page = expectedPage,
+                filter = expectedFilter
             )
 
             _uiState.update { state ->
-                val resolvedPage = (res as? UiResult.Success)?.data?.currentPage ?: state.currentPage
+                if (state.requestedSlugOrUrl != expectedRequested ||
+                    state.filter != expectedFilter ||
+                    state.currentPage != expectedPage ||
+                    state.singleEntryId != null
+                ) {
+                    return@update state
+                }
+                val successDetail = (res as? UiResult.Success)?.data
+                val resolvedPage = successDetail?.currentPage ?: state.currentPage
+                val resolvedCanonical = successDetail?.canonicalUrl
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() && it != "/" && !it.equals("/entry", ignoreCase = true) }
+                    ?: state.canonicalSlug
                 state.copy(
                     isRefreshing = false,
                     currentPage = resolvedPage,
+                    canonicalSlug = resolvedCanonical,
                     result = res
                 )
             }

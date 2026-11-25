@@ -6,6 +6,7 @@ import com.example.data.model.ChannelTag
 import com.example.data.model.DirectMessageItem
 import com.example.data.model.EntryItem
 import com.example.data.model.EntrySegment
+import com.example.data.model.MessageDeleteMeta
 import com.example.data.model.MessageFormMeta
 import com.example.data.model.MessageInboxData
 import com.example.data.model.MessageThreadDetail
@@ -83,13 +84,7 @@ object EksiHtmlParser {
             ?: requestedUrl
         val canonicalUrl = normalizePath(canonicalHref).substringBefore("?")
 
-        val pagerEl = doc.selectFirst("div.pager")
-        val currentPage = pagerEl?.attr("data-currentpage")?.toIntOrNull()
-            ?: doc.selectFirst("select.pager option[selected]")?.attr("value")?.toIntOrNull()
-            ?: 1
-        val totalPages = pagerEl?.attr("data-pagecount")?.toIntOrNull()
-            ?: doc.select("select.pager option").lastOrNull()?.attr("value")?.toIntOrNull()
-            ?: 1
+        val (currentPage, totalPages) = extractPagerInfo(doc, requestedUrl)
 
         val channels = doc.select("section#topic-channels ul li a").mapNotNull { ch ->
             val name = ch.text().trim()
@@ -121,8 +116,9 @@ object EksiHtmlParser {
             }
         }
 
-        val token = entryFormFields["__RequestVerificationToken"]
-            ?: doc.selectFirst("input[name=__RequestVerificationToken]")?.attr("value")
+        val token = entryFormFields["__RequestVerificationToken"]?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("input[name=__RequestVerificationToken]")?.attr("value")?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("meta[name=csrf-token], meta[name=__RequestVerificationToken]")?.attr("content")?.takeIf { it.isNotBlank() }
 
         return TopicDetail(
             title = title,
@@ -299,15 +295,74 @@ object EksiHtmlParser {
             }
         }
 
-        val pagerEl = doc.selectFirst("div.pager")
-        val currentPage = pagerEl?.attr("data-currentpage")?.toIntOrNull()
-            ?: doc.selectFirst("select.pager option[selected]")?.attr("value")?.toIntOrNull()
-            ?: 1
-        val totalPages = pagerEl?.attr("data-pagecount")?.toIntOrNull()
-            ?: doc.select("select.pager option").lastOrNull()?.attr("value")?.toIntOrNull()
+        val (currentPage, totalPages) = extractPagerInfo(doc)
+
+        return Triple(entries.distinctBy { it.id }, currentPage, totalPages)
+    }
+
+    internal fun extractPagerInfo(
+        doc: org.jsoup.nodes.Document,
+        requestedUrl: String = ""
+    ): Pair<Int, Int> {
+        val pagerElements = doc.select("div.pager, .pager")
+
+        val currentPage = pagerElements.firstNotNullOfOrNull { el ->
+            parsePositivePageInt(el.attr("data-currentpage"))
+        } ?: pagerElements.firstNotNullOfOrNull { el ->
+            val opt = el.selectFirst("select option[selected]")
+            parsePositivePageInt(opt?.attr("value")) ?: parsePositivePageInt(opt?.text())
+        } ?: doc.selectFirst("select.pager option[selected]")?.let { opt ->
+            parsePositivePageInt(opt.attr("value")) ?: parsePositivePageInt(opt.text())
+        } ?: pagerElements.firstNotNullOfOrNull { el ->
+            parsePositivePageInt(el.selectFirst("a.current, span.current, .active")?.text())
+        } ?: extractPageParamFromUrl(requestedUrl)
             ?: 1
 
-        return Triple(entries.distinctBy { it.id }, currentPage.coerceAtLeast(1), totalPages.coerceAtLeast(1))
+        val totalFromAttr = pagerElements.firstNotNullOfOrNull { el ->
+            parsePositivePageInt(el.attr("data-pagecount"))
+        }
+        val totalFromLastLink = pagerElements.firstNotNullOfOrNull { el ->
+            el.selectFirst("a.last")?.let { last ->
+                parsePositivePageInt(last.text()) ?: extractPageParamFromUrl(last.attr("href"))
+            }
+        } ?: doc.selectFirst("a.last")?.let { last ->
+            parsePositivePageInt(last.text()) ?: extractPageParamFromUrl(last.attr("href"))
+        }
+        val totalFromSelect = pagerElements.flatMap { it.select("select option") }
+            .plus(doc.select("select.pager option"))
+            .mapNotNull { opt ->
+                parsePositivePageInt(opt.attr("value")) ?: parsePositivePageInt(opt.text())
+            }
+            .maxOrNull()
+        val totalFromLinks = pagerElements.flatMap { it.select("a[href]") }
+            .mapNotNull { a -> extractPageParamFromUrl(a.attr("href")) ?: parsePositivePageInt(a.text()) }
+            .maxOrNull()
+
+        val rawTotal = totalFromAttr
+            ?: totalFromLastLink
+            ?: totalFromSelect
+            ?: totalFromLinks
+            ?: 1
+
+        val safeCurrent = currentPage.coerceAtLeast(1)
+        val safeTotal = rawTotal.coerceAtLeast(safeCurrent).coerceAtLeast(1)
+        return safeCurrent to safeTotal
+    }
+
+    private fun parsePositivePageInt(raw: String?): Int? {
+        if (raw.isNullOrBlank()) return null
+        val cleaned = raw.trim().replace(".", "").replace(",", "").replace(" ", "")
+        return cleaned.toIntOrNull()?.takeIf { it > 0 }
+    }
+
+    private fun extractPageParamFromUrl(url: String?): Int? {
+        if (url.isNullOrBlank()) return null
+        val query = url.substringAfter("?", "").substringBefore("#")
+        if (query.isBlank()) return null
+        return query.split("&")
+            .firstOrNull { it.startsWith("p=", ignoreCase = true) }
+            ?.substringAfter("=")
+            ?.let(::parsePositivePageInt)
     }
 
     fun parseLoggedInNick(html: String): String? {
@@ -357,9 +412,11 @@ object EksiHtmlParser {
 
     fun parsePostEntryError(html: String): String? {
         val doc = Jsoup.parse(html, "https://eksisozluk.com")
-        val errors = doc.select(".validation-summary-errors li, .field-validation-error, div.error-message, p.error")
-            .mapNotNull { it.text().trim().takeIf { t -> t.isNotBlank() } }
-        if (errors.isNotEmpty()) return errors.joinToString("\n")
+        val errors = doc.select(
+            ".validation-summary-errors li, .field-validation-error, span.field-validation-error, " +
+                "div.error-message, p.error, .toast-error, div.alert-danger, #error-message"
+        ).mapNotNull { it.text().trim().takeIf { t -> t.isNotBlank() } }
+        if (errors.isNotEmpty()) return errors.distinct().joinToString("\n")
         if (doc.selectFirst("form[action*=/giris]") != null) {
             return "Oturumunuz sona ermiş görünüyor. Lütfen tekrar giriş yapın."
         }
@@ -383,6 +440,13 @@ object EksiHtmlParser {
                 "li[data-thread-id]"
         )
 
+        val composeForm = extractMessageFormMeta(doc)
+        val pageToken = doc.selectFirst("input[name=__RequestVerificationToken]")
+            ?.attr("value")
+            ?.takeIf { it.isNotBlank() }
+            ?: composeForm?.fields?.get("__RequestVerificationToken")?.takeIf { it.isNotBlank() }
+        val pageDeleteForm = extractPageLevelDeleteFormMeta(doc, pageToken)
+
         for (item in containers) {
             val link = item.selectFirst("a[href*=/mesaj/], a[href^=/mesaj?]")
                 ?: item.takeIf { it.tagName() == "a" }
@@ -402,7 +466,9 @@ object EksiHtmlParser {
             val dateText = item.selectFirst("time, .date, small, span.time")?.text()?.trim().orEmpty()
             val previewEl = item.selectFirst("p, .preview, .last-message, .message-preview, .content")
             val preview = previewEl?.text()?.trim()
-                ?: item.text().trim()
+                ?: item.clone().apply {
+                    select("form, button, .actions, .delete, a[href*=/mesaj/sil], a[href*=/mesaj/arsiv]").remove()
+                }.text().trim()
                     .removePrefix(nick)
                     .removeSuffix(dateText)
                     .trim()
@@ -411,9 +477,14 @@ object EksiHtmlParser {
                 item.attr("data-unread").equals("true", ignoreCase = true) ||
                 item.selectFirst(".unread") != null
 
-            val threadId = item.attr("data-id")
-                .ifBlank { item.attr("data-thread-id") }
-                .ifBlank { threadUrl.substringAfterLast("/").substringBefore("?") }
+            val threadId = extractThreadId(item, threadUrl)
+
+            val deleteMeta = extractMessageDeleteMeta(
+                container = item,
+                fallbackToken = pageToken,
+                threadId = threadId,
+                pageDeleteForm = pageDeleteForm
+            )
 
             threads.add(
                 MessageThreadSummary(
@@ -422,7 +493,8 @@ object EksiHtmlParser {
                     participantNick = nick,
                     preview = preview.take(140),
                     dateText = dateText,
-                    isUnread = isUnread
+                    isUnread = isUnread,
+                    deleteMeta = deleteMeta
                 )
             )
         }
@@ -444,8 +516,15 @@ object EksiHtmlParser {
                 val preview = a.selectFirst("p, .preview, .last-message")?.text()?.trim()
                     ?: parent?.selectFirst("p, .preview, .last-message")?.text()?.trim().orEmpty()
                 val isUnread = a.hasClass("unread") || parent?.hasClass("unread") == true
-                val threadId = parent?.attr("data-id")?.takeIf { it.isNotBlank() }
-                    ?: threadUrl.substringAfterLast("/").substringBefore("?")
+                val threadId = extractThreadId(parent ?: a, threadUrl)
+                val deleteMeta = parent?.let {
+                    extractMessageDeleteMeta(
+                        container = it,
+                        fallbackToken = pageToken,
+                        threadId = threadId,
+                        pageDeleteForm = pageDeleteForm
+                    )
+                }
                 threads.add(
                     MessageThreadSummary(
                         threadId = threadId,
@@ -453,16 +532,17 @@ object EksiHtmlParser {
                         participantNick = nick.take(48),
                         preview = preview.take(140),
                         dateText = dateText,
-                        isUnread = isUnread
+                        isUnread = isUnread,
+                        deleteMeta = deleteMeta
                     )
                 )
             }
         }
 
-        val composeForm = extractMessageFormMeta(doc)
         return MessageInboxData(
             threads = threads,
             composeForm = composeForm,
+            verificationToken = pageToken,
             requiresLogin = false
         )
     }
@@ -482,25 +562,57 @@ object EksiHtmlParser {
             )
         }
 
-        val participantNick = doc.selectFirst(
-            "h1#title a, h1#title, h2#thread-title, #message-thread-title, h1, h2.author"
+        val resolvedCurrentNick = currentUserNick?.takeIf { it.isNotBlank() } ?: parseLoggedInNick(html)
+
+        val headerAuthorNick = doc.selectFirst(
+            "h1#title a[href^=/biri/], h1 a[href^=/biri/], h2 a[href^=/biri/], " +
+                "#message-thread-title a[href^=/biri/], .thread-title a[href^=/biri/]"
+        )?.text()?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
+
+        val headingNick = doc.selectFirst(
+            "h1#title, h2#thread-title, #message-thread-title, h2.author, h1"
         )?.text()?.trim()
             ?.removePrefix("@")
-            ?.takeIf { it.isNotBlank() && !it.equals("mesajlar", ignoreCase = true) }
-            ?: doc.selectFirst("a[href^=/biri/]:not([title=ben])")?.text()?.trim()
+            ?.replace(Regex("\\s+ile\\s+mesaj.*$", RegexOption.IGNORE_CASE), "")
+            ?.trim()
+            ?.takeIf {
+                it.isNotBlank() &&
+                    !it.equals("mesajlar", ignoreCase = true) &&
+                    !it.equals("gelen kutusu", ignoreCase = true)
+            }
+
+        val participantNick = headerAuthorNick
+            ?: headingNick
+            ?: doc.selectFirst("#content-body a[href^=/biri/]:not([title=ben]), main a[href^=/biri/]:not([title=ben]), a[href^=/biri/]:not([title=ben])")
+                ?.text()?.trim()?.removePrefix("@")
             ?: "Sohbet"
 
         val messageElements = doc.select(
-            "ul#message-thread > li, div#message-thread > article, div#message-thread > div, " +
-                "ul.message-list > li, article.message, div.message-item, li.incoming, li.outgoing, div.incoming, div.outgoing"
+            "ul#message-thread > li, ol#message-thread > li, div#message-thread > article, " +
+                "div#message-thread > div, section#message-thread article, " +
+                ".message-thread > li, .message-thread article, .message-thread > div, " +
+                "ul.message-list > li, article.message, div.message-item, " +
+                "li.incoming, li.outgoing, div.incoming, div.outgoing, " +
+                "#messages article, #messages > li, #messages > div.message"
         )
 
         val messages = mutableListOf<DirectMessageItem>()
         messageElements.forEachIndexed { idx, el ->
-            val contentEl = el.selectFirst("div.content, p.message-body, div.message-content, p")
-                ?: el
+            // Skip containers that are actually the reply form or pagination/actions bar
+            if (el.tagName().equals("form", ignoreCase = true) ||
+                el.selectFirst("textarea") != null ||
+                el.hasClass("pager") ||
+                el.hasClass("actions")
+            ) {
+                return@forEachIndexed
+            }
+
+            val contentEl = el.selectFirst("div.content, p.message-body, div.message-content, div.body, p")
+                ?: el.clone().apply {
+                    select("time, .date, small, footer, .sender, .author, a[href^=/biri/], .actions").remove()
+                }
             val segments = parseContentSegments(contentEl)
-            val body = segmentsToPlainText(segments).ifBlank { el.text().trim() }
+            val body = segmentsToPlainText(segments).ifBlank { contentEl.text().trim() }
             if (body.isBlank()) return@forEachIndexed
 
             val senderNick = el.attr("data-author")
@@ -511,9 +623,10 @@ object EksiHtmlParser {
                 el.hasClass("sent") ||
                 el.hasClass("mine") ||
                 el.hasClass("from-me") ||
+                el.attr("data-outgoing").equals("true", ignoreCase = true) ||
                 (!el.hasClass("incoming") &&
-                    !currentUserNick.isNullOrBlank() &&
-                    senderNick.equals(currentUserNick, ignoreCase = true))
+                    !resolvedCurrentNick.isNullOrBlank() &&
+                    senderNick.equals(resolvedCurrentNick, ignoreCase = true))
 
             val sentAt = el.selectFirst("time, .date, small, footer a, span.time")?.text()?.trim().orEmpty()
             val id = el.attr("data-id").ifBlank { "${idx}_${body.hashCode()}" }
@@ -530,9 +643,10 @@ object EksiHtmlParser {
             )
         }
 
-        val replyForm = extractMessageFormMeta(doc)
+        val normalizedUrl = normalizePath(requestedUrl).ifBlank { "/mesaj/yeni" }
+        val replyForm = extractMessageFormMeta(doc, fallbackAction = normalizedUrl)
         return MessageThreadDetail(
-            threadUrl = normalizePath(requestedUrl),
+            threadUrl = normalizedUrl,
             participantNick = participantNick,
             messages = messages,
             replyForm = replyForm,
@@ -540,42 +654,451 @@ object EksiHtmlParser {
         )
     }
 
-    fun extractMessageFormMeta(doc: org.jsoup.nodes.Document): MessageFormMeta? {
-        val form = doc.selectFirst("form[action*=/mesaj], form#message-send-form, form#new-message-form")
-            ?: doc.select("form").firstOrNull { f ->
-                f.selectFirst("textarea[name=Message], textarea[name=Body], textarea[name=Content], textarea") != null &&
-                    !f.attr("action").contains("giris", ignoreCase = true)
-            } ?: return null
+    fun extractMessageFormMeta(
+        doc: org.jsoup.nodes.Document,
+        fallbackAction: String = "/mesaj/yeni"
+    ): MessageFormMeta? {
+        val formsWithTextarea = doc.select("form").filter { f ->
+            val action = f.attr("action").lowercase()
+            f.selectFirst("textarea") != null &&
+                !action.contains("giris") &&
+                !action.contains("/basliklar/ara") &&
+                !action.contains("/arama") &&
+                !action.contains("/mesaj/sil") &&
+                !action.contains("/mesaj/arsiv")
+        }
 
-        val action = form.attr("action").trim().ifBlank { "/mesaj/yeni" }
+        val form = formsWithTextarea.firstOrNull { f ->
+            val id = f.id().lowercase()
+            val action = f.attr("action").lowercase()
+            id.contains("message") || action.contains("/mesaj")
+        }
+            ?: formsWithTextarea.firstOrNull { f ->
+                f.selectFirst("textarea[name=Message], textarea[name=Body], textarea[name=Content]") != null
+            }
+            ?: formsWithTextarea.firstOrNull()
+            ?: return null
+
+        val action = form.attr("action").trim().ifBlank { fallbackAction }
         val fields = LinkedHashMap<String, String>()
         form.select("input[name]").forEach { input ->
             val name = input.attr("name").trim()
+            val type = input.attr("type").lowercase()
+            if (name.isBlank()) return@forEach
+            if (type == "submit" || type == "button" || type == "reset" || type == "image") return@forEach
+            if ((type == "checkbox" || type == "radio") && !input.hasAttr("checked")) return@forEach
+            fields[name] = input.attr("value")
+        }
+        form.select("select[name]").forEach { select ->
+            val name = select.attr("name").trim()
             if (name.isNotBlank()) {
-                fields[name] = input.attr("value")
+                val selected = select.selectFirst("option[selected]")?.attr("value")
+                    ?: select.selectFirst("option")?.attr("value")
+                    ?: ""
+                fields[name] = selected
             }
         }
 
-        val recipientFieldName = form.select("input[name]")
+        if (!fields.containsKey("__RequestVerificationToken")) {
+            doc.selectFirst("input[name=__RequestVerificationToken]")?.attr("value")?.let { token ->
+                if (token.isNotBlank()) {
+                    fields["__RequestVerificationToken"] = token
+                }
+            }
+        }
+
+        val visibleRecipientInput = form.select("input[name]")
             .firstOrNull { input ->
                 val name = input.attr("name").lowercase()
                 val type = input.attr("type").lowercase()
-                type != "hidden" && (name.contains("to") || name.contains("nick") || name.contains("receiver") || name.contains("alici"))
+                type != "hidden" && (
+                    name.contains("to") ||
+                        name.contains("nick") ||
+                        name.contains("receiver") ||
+                        name.contains("recipient") ||
+                        name.contains("alici")
+                    )
             }?.attr("name")?.takeIf { it.isNotBlank() }
-            ?: fields.keys.firstOrNull {
-                val lower = it.lowercase()
-                lower == "to" || lower == "nick" || lower == "receiver"
-            }
-            ?: "To"
+
+        val hiddenRecipientField = fields.keys.firstOrNull {
+            val lower = it.lowercase()
+            lower == "to" || lower == "nick" || lower == "receiver" || lower == "recipient"
+        }
+
+        val recipientFieldName = visibleRecipientInput ?: hiddenRecipientField ?: "To"
+        val hasRecipientInput = visibleRecipientInput != null || hiddenRecipientField != null
 
         val bodyFieldName = form.selectFirst("textarea[name]")?.attr("name")?.takeIf { it.isNotBlank() }
             ?: "Message"
+
+        val isAjax = form.attr("data-ajax").equals("true", ignoreCase = true)
 
         return MessageFormMeta(
             action = action,
             fields = fields,
             recipientFieldName = recipientFieldName,
-            bodyFieldName = bodyFieldName
+            bodyFieldName = bodyFieldName,
+            hasRecipientInput = hasRecipientInput,
+            isAjax = isAjax
+        )
+    }
+
+    private fun extractThreadId(container: Element, threadUrl: String): String {
+        val attrId = listOf(
+            container.attr("data-id"),
+            container.attr("data-thread-id"),
+            container.attr("data-konusma-id"),
+            container.selectFirst("[data-thread-id]")?.attr("data-thread-id").orEmpty(),
+            container.selectFirst("[data-konusma-id]")?.attr("data-konusma-id").orEmpty(),
+            container.selectFirst("input[type=checkbox][value]")?.attr("value").orEmpty()
+        ).map { it.trim() }
+            .firstOrNull { it.isNotBlank() && it != "0" }
+        if (attrId != null) return attrId
+
+        val query = threadUrl.substringAfter("?", "")
+        if (query.isNotBlank()) {
+            Regex("(?:^|&)(?:threadId|konusmaId|id)=([^&]+)", RegexOption.IGNORE_CASE)
+                .find(query)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.trim()
+                ?.takeIf { it.isNotBlank() && it != "0" }
+                ?.let { return it }
+        }
+        val tail = threadUrl.substringBefore("?").trimEnd('/').substringAfterLast("/").trim()
+        return tail.takeIf { it.isNotBlank() && it != "0" && !it.equals("mesaj", ignoreCase = true) }.orEmpty()
+    }
+
+    private fun extractPageLevelDeleteFormMeta(
+        doc: org.jsoup.nodes.Document,
+        fallbackToken: String?
+    ): MessageDeleteMeta? {
+        val deleteForm = doc.select("form").firstOrNull { form ->
+            isDeleteMessageForm(form)
+        } ?: return null
+
+        val action = deleteForm.attr("action").trim().ifBlank { "/mesaj/sil" }
+        val fields = collectDeleteFormFields(deleteForm, fallbackToken)
+        val isAjax = deleteForm.attr("data-ajax").equals("true", ignoreCase = true)
+        return MessageDeleteMeta(action = action, fields = fields, isAjax = isAjax)
+    }
+
+    fun extractMessageDeleteMetaFromPage(
+        doc: org.jsoup.nodes.Document,
+        threadId: String? = null
+    ): MessageDeleteMeta? {
+        val pageToken = doc.selectFirst("input[name=__RequestVerificationToken]")
+            ?.attr("value")
+            ?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("meta[name=csrf-token], meta[name=__RequestVerificationToken]")
+                ?.attr("content")
+                ?.takeIf { it.isNotBlank() }
+        val resolvedId = extractThreadIdFromDocument(doc, threadId.orEmpty())
+            .takeIf { it.isNotBlank() }
+        return extractMessageDeleteMeta(
+            container = doc,
+            fallbackToken = pageToken,
+            threadId = resolvedId,
+            pageDeleteForm = null
+        )
+    }
+
+    fun extractThreadIdFromDocument(
+        doc: org.jsoup.nodes.Document,
+        fallbackId: String = ""
+    ): String {
+        fun isValidId(value: String): Boolean = value.isNotBlank() && value != "0"
+        fun isPositiveNumeric(value: String): Boolean = value.toLongOrNull()?.let { it > 0L } == true
+
+        val scopes = doc.select(
+            "#content-body, main, #main, #message-thread, form[action*=/mesaj], " +
+                ".message-thread, #threads, #message-thread-list"
+        )
+        val scopedCandidates = mutableListOf<String>()
+
+        fun collectFromRoot(root: Element, includeGenericIdInputs: Boolean) {
+            val inputSelectors = if (includeGenericIdInputs) {
+                "input[name=ThreadId], input[name=threadId], input[name=konusmaId], input[name=KonusmaId], " +
+                    "input[name=messageThreadId], input[name=Id], input[name=id], " +
+                    "input[name=threadIds], input[name=thread], input[name=Thread]"
+            } else {
+                "input[name=ThreadId], input[name=threadId], input[name=konusmaId], input[name=KonusmaId], " +
+                    "input[name=messageThreadId], input[name=threadIds]"
+            }
+            root.select(inputSelectors).forEach { el ->
+                val v = el.attr("value").trim()
+                if (isValidId(v)) scopedCandidates.add(v)
+            }
+
+            val attrSelectors = if (includeGenericIdInputs) {
+                "[data-thread-id], [data-konusma-id], [data-thread], " +
+                    "#message-thread[data-id], .delete-message[data-id], .delete-thread[data-id], " +
+                    "form[action*=sil] [data-id], a[data-id][href*=mesaj], button[data-id]"
+            } else {
+                "[data-thread-id], [data-konusma-id], [data-thread], " +
+                    "#message-thread[data-id], .delete-message[data-id], .delete-thread[data-id], " +
+                    "form[action*=sil] [data-id], a[data-id][href*=mesaj]"
+            }
+            root.select(attrSelectors).forEach { el ->
+                listOf(
+                    el.attr("data-thread-id"),
+                    el.attr("data-konusma-id"),
+                    el.attr("data-thread"),
+                    el.attr("data-id")
+                ).map { it.trim() }
+                    .filter(::isValidId)
+                    .forEach { scopedCandidates.add(it) }
+            }
+        }
+
+        if (scopes.isNotEmpty()) {
+            scopes.forEach { collectFromRoot(it, includeGenericIdInputs = true) }
+        }
+        collectFromRoot(doc, includeGenericIdInputs = scopes.isEmpty())
+
+        doc.select("form[action*=/mesaj/]").forEach { f ->
+            Regex("/mesaj/(?:konusma/)?(?:sil/)?(\\d+)", RegexOption.IGNORE_CASE)
+                .find(f.attr("action"))
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.trim()
+                ?.takeIf(::isValidId)
+                ?.let { scopedCandidates.add(it) }
+        }
+
+        val html = doc.html()
+        Regex("""(?:threadId|konusmaId|messageThreadId|thread_id)\s*[:=]\s*['"]?(\d+)['"]?""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .mapNotNull { it.groupValues.getOrNull(1)?.trim()?.takeIf(::isValidId) }
+            .forEach { scopedCandidates.add(it) }
+
+        scopedCandidates.firstOrNull(::isPositiveNumeric)?.let { return it }
+
+        val cleanFallback = fallbackId.trim().takeIf(::isValidId)
+        if (cleanFallback != null && isPositiveNumeric(cleanFallback)) {
+            return cleanFallback
+        }
+
+        return scopedCandidates.firstOrNull()
+            ?: cleanFallback
+            ?: ""
+    }
+
+    fun extractDeleteEndpointsFromHtml(html: String): List<String> {
+        if (html.isBlank()) return emptyList()
+        val regex = Regex(
+            """['"`]((?:https?://(?:www\.|m\.)?eksisozluk\.com)?/(?:mesaj|api)/[^'"`\s<>]+)['"`]""",
+            RegexOption.IGNORE_CASE
+        )
+        return regex.findAll(html)
+            .mapNotNull { m ->
+                val rawCaptured = m.groupValues.getOrNull(1)?.trim() ?: return@mapNotNull null
+                val strippedInterpolation = if (rawCaptured.contains("\${")) {
+                    rawCaptured.substringBefore("\${")
+                } else {
+                    rawCaptured
+                }
+                val normalized = normalizePath(strippedInterpolation).trim()
+                if (normalized.isBlank() || normalized.startsWith("http")) return@mapNotNull null
+                val lower = normalized.lowercase()
+                val looksLikeDelete = lower.contains("sil") ||
+                    lower.contains("delete") ||
+                    lower.contains("remove") ||
+                    lower.contains("kaldir") ||
+                    lower.contains("temizle")
+                val isMessageApi = if (lower.startsWith("/api/")) {
+                    lower.contains("mesaj") ||
+                        lower.contains("message") ||
+                        lower.contains("thread") ||
+                        lower.contains("konusma") ||
+                        lower.contains("dm") ||
+                        lower.contains("pm")
+                } else {
+                    true
+                }
+                val excluded = lower.startsWith("/mesaj/yeni") ||
+                    lower.startsWith("/mesaj/arsiv") ||
+                    lower.startsWith("/mesaj/ara") ||
+                    lower.startsWith("/mesaj/send") ||
+                    lower.startsWith("/mesaj/engelle") ||
+                    lower.startsWith("/mesaj/okundu") ||
+                    lower.endsWith(".js") ||
+                    lower.endsWith(".css") ||
+                    lower.endsWith(".png") ||
+                    lower.endsWith(".svg")
+                if (looksLikeDelete && isMessageApi && !excluded) normalized else null
+            }
+            .distinct()
+            .toList()
+    }
+
+    private fun normalizeMessageActionPath(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isBlank()) return "/mesaj/sil"
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+            return normalizePath(trimmed)
+        }
+        if (trimmed.startsWith("/")) return trimmed
+        val clean = trimmed.removePrefix("./")
+        return if (clean.startsWith("mesaj/")) "/$clean" else "/mesaj/$clean"
+    }
+
+    private fun isDeleteMessageForm(form: Element): Boolean {
+        if (form.selectFirst("textarea") != null) return false
+        val action = form.attr("action").lowercase()
+        val id = form.id().lowercase()
+        val cls = form.className().lowercase()
+        if (action.contains("giris") || action.contains("arsiv") || action.contains("engelle") || action.contains("okundu")) {
+            return false
+        }
+        val submitText = form.select("button, input[type=submit], a")
+            .joinToString(" ") { el ->
+                listOf(
+                    el.text(),
+                    el.attr("value"),
+                    el.attr("title"),
+                    el.attr("aria-label"),
+                    el.attr("data-original-title")
+                ).joinToString(" ")
+            }.trim().lowercase()
+        val actionIsDelete = (action.contains("sil") || action.contains("delete") || action.contains("remove") ||
+            action.contains("kaldir") || action.contains("temizle"))
+        val attrIsDelete = id.contains("delete") || id.contains("sil") || cls.contains("delete")
+        val textIsDelete = submitText == "sil" ||
+            submitText.contains("konuşmayı sil") ||
+            submitText.contains("sohbeti sil") ||
+            submitText.contains("mesajı sil") ||
+            submitText.contains("mesajları sil")
+        return actionIsDelete || attrIsDelete || textIsDelete
+    }
+
+    private fun collectDeleteFormFields(
+        form: Element,
+        fallbackToken: String?
+    ): LinkedHashMap<String, String> {
+        val fields = LinkedHashMap<String, String>()
+        form.select("input[name]").forEach { input ->
+            val name = input.attr("name").trim()
+            val type = input.attr("type").lowercase()
+            if (name.isBlank()) return@forEach
+            if (type == "button" || type == "reset" || type == "image" || type == "checkbox") return@forEach
+            if (type == "submit") {
+                val v = input.attr("value").trim()
+                if (v.contains("sil", ignoreCase = true) || v.contains("delete", ignoreCase = true)) {
+                    fields[name] = input.attr("value")
+                }
+                return@forEach
+            }
+            if (type == "radio" && !input.hasAttr("checked")) return@forEach
+            fields[name] = input.attr("value")
+        }
+        form.select("button[type=submit][name], button:not([type])[name]").forEach { btn ->
+            val name = btn.attr("name").trim()
+            val txt = (btn.text() + " " + btn.attr("value") + " " + btn.attr("title")).lowercase()
+            if (name.isNotBlank() && (txt.contains("sil") || txt.contains("delete"))) {
+                fields[name] = btn.attr("value").ifBlank { "sil" }
+            }
+        }
+        if (!fields.containsKey("__RequestVerificationToken") && !fallbackToken.isNullOrBlank()) {
+            fields["__RequestVerificationToken"] = fallbackToken
+        }
+        return fields
+    }
+
+    fun extractMessageDeleteMeta(
+        container: Element,
+        fallbackToken: String? = null,
+        threadId: String? = null,
+        pageDeleteForm: MessageDeleteMeta? = null
+    ): MessageDeleteMeta? {
+        val deleteForm = container.select("form").firstOrNull { isDeleteMessageForm(it) }
+        if (deleteForm != null) {
+            val action = normalizeMessageActionPath(deleteForm.attr("action").trim().ifBlank { "/mesaj/sil" })
+            val fields = collectDeleteFormFields(deleteForm, fallbackToken)
+            val hasIdField = fields.keys.any {
+                val lower = it.lowercase()
+                lower == "id" || lower == "threadid" || lower == "messageid" || lower == "threadids"
+            }
+            if (!hasIdField && !threadId.isNullOrBlank() && !action.contains("/$threadId")) {
+                fields["id"] = threadId
+            }
+            val isAjax = deleteForm.attr("data-ajax").equals("true", ignoreCase = true)
+            return MessageDeleteMeta(
+                action = action,
+                fields = fields,
+                isAjax = isAjax
+            )
+        }
+
+        // If row has a checkbox inside an inbox page-level bulk-delete form
+        val checkbox = container.selectFirst("input[type=checkbox][name]")
+        if (checkbox != null && pageDeleteForm != null) {
+            val cbName = checkbox.attr("name").trim()
+            val cbVal = checkbox.attr("value").ifBlank { threadId.orEmpty() }
+            if (cbName.isNotBlank() && cbVal.isNotBlank()) {
+                val fields = LinkedHashMap<String, String>()
+                fields.putAll(pageDeleteForm.fields)
+                fields[cbName] = cbVal
+                return MessageDeleteMeta(
+                    action = normalizeMessageActionPath(pageDeleteForm.action),
+                    fields = fields,
+                    isAjax = pageDeleteForm.isAjax
+                )
+            }
+        }
+
+        val deleteTrigger = container.selectFirst(
+            "a[href*=/mesaj/][href*=sil], a[data-url*=/mesaj/][data-url*=sil], button[data-url*=/mesaj/][data-url*=sil], " +
+                "a[data-action*=/mesaj/][data-action*=sil], button[data-action*=/mesaj/][data-action*=sil], " +
+                "a[href*=konusmasil], button[data-url*=sil], a[data-url*=sil], " +
+                "a.delete-message, button.delete-message, a.delete-thread, button.delete-thread, " +
+                "[data-delete-url], .actions a[href*=sil], .actions button[data-action*=delete]"
+        ) ?: container.select("a, button").firstOrNull { el ->
+            val txt = el.text().trim().lowercase()
+            val label = (el.attr("title") + " " + el.attr("aria-label") + " " + el.attr("data-original-title")).trim().lowercase()
+            val cls = el.className().lowercase()
+            val href = el.attr("href").lowercase()
+            if (href.contains("arsiv") || href.contains("engelle")) return@firstOrNull false
+            val hasDeleteAttr = el.hasAttr("data-delete-url") ||
+                el.attr("data-action").contains("delete", ignoreCase = true) ||
+                el.attr("data-action").contains("sil", ignoreCase = true) ||
+                el.attr("data-url").contains("sil", ignoreCase = true) ||
+                el.attr("data-url").contains("delete", ignoreCase = true) ||
+                cls.contains("delete")
+            val textMatchesDelete = txt == "sil" ||
+                txt == "konuşmayı sil" ||
+                txt == "sohbeti sil" ||
+                txt == "mesajı sil" ||
+                label == "sil" ||
+                label.contains("konuşmayı sil") ||
+                label.contains("sohbeti sil") ||
+                label.contains("mesajı sil")
+            hasDeleteAttr || (textMatchesDelete && (!threadId.isNullOrBlank() || el.hasAttr("data-id") || el.hasAttr("data-thread-id") || href.contains("/mesaj/")))
+        } ?: return null
+
+        val rawUrl = deleteTrigger.attr("data-url")
+            .ifBlank { deleteTrigger.attr("data-delete-url") }
+            .ifBlank { deleteTrigger.attr("data-action") }
+            .ifBlank { deleteTrigger.attr("href") }
+            .trim()
+            .takeIf { it.isNotBlank() && it != "#" && !it.startsWith("javascript", ignoreCase = true) }
+            ?: "/mesaj/sil"
+
+        val action = normalizeMessageActionPath(rawUrl)
+        val fields = LinkedHashMap<String, String>()
+        if (!fallbackToken.isNullOrBlank()) {
+            fields["__RequestVerificationToken"] = fallbackToken
+        }
+        val explicitId = deleteTrigger.attr("data-id")
+            .ifBlank { deleteTrigger.attr("data-thread-id") }
+            .ifBlank { threadId.orEmpty() }
+        if (explicitId.isNotBlank() && !action.contains("/$explicitId")) {
+            fields["id"] = explicitId
+        }
+        return MessageDeleteMeta(
+            action = action,
+            fields = fields,
+            isAjax = true
         )
     }
 
@@ -585,8 +1108,12 @@ object EksiHtmlParser {
             path == "/mesaj" ||
             path == "/mesaj/" ||
             path == "/mesaj/yeni" ||
-            path == "/mesaj/arsiv" ||
-            path == "/mesaj/sil" ||
+            path.startsWith("/mesaj/arsiv") ||
+            path.startsWith("/mesaj/sil") ||
+            path.startsWith("/mesaj/ara") ||
+            path.startsWith("/mesaj/send") ||
+            path.startsWith("/mesaj/engelle") ||
+            path.startsWith("/mesaj/okundu") ||
             !path.startsWith("/mesaj")
     }
 
@@ -613,7 +1140,8 @@ object EksiHtmlParser {
         val favoriteCount = li.attr("data-favorite-count").toIntOrNull()
             ?: li.selectFirst("a.favorite-count")?.text()?.trim()?.toIntOrNull()
             ?: 0
-        val isFavorited = li.attr("data-isfavorite").equals("true", ignoreCase = true)
+        val isFavorited = li.attr("data-isfavorite").equals("true", ignoreCase = true) ||
+            li.selectFirst("a.favorite-link.favorited, .favorite-link.active, [data-isfavorite=true]") != null
 
         val contentEl = li.selectFirst("div.content")
         val segments = if (contentEl != null) {
@@ -797,9 +1325,20 @@ object EksiHtmlParser {
     }
 
     fun normalizePath(href: String): String {
-        val withoutHost = href
+        val trimmed = href.trim()
+        val withoutHost = trimmed
             .removePrefix("https://eksisozluk.com")
             .removePrefix("http://eksisozluk.com")
+            .removePrefix("https://www.eksisozluk.com")
+            .removePrefix("http://www.eksisozluk.com")
+            .removePrefix("https://m.eksisozluk.com")
+            .removePrefix("http://m.eksisozluk.com")
+            .removePrefix("//eksisozluk.com")
+            .removePrefix("//www.eksisozluk.com")
+            .removePrefix("//m.eksisozluk.com")
+        if (withoutHost.startsWith("http://") || withoutHost.startsWith("https://")) {
+            return withoutHost
+        }
         return if (withoutHost.startsWith("/")) withoutHost else "/$withoutHost"
     }
 }

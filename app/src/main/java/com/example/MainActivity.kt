@@ -1,10 +1,15 @@
 package com.example
 
+import android.Manifest
+import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -38,8 +43,12 @@ import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -55,6 +64,8 @@ import androidx.navigation.navArgument
 import com.example.data.local.ThemeMode
 import com.example.data.local.UserPreferences
 import com.example.data.model.DEFAULT_EKSI_CHANNELS
+import com.example.notifications.MessageNotificationHelper
+import com.example.notifications.MessageNotificationScheduler
 import com.example.ui.components.EmptyEditorialView
 import com.example.ui.screens.AuthorScreen
 import com.example.ui.screens.FeedScreen
@@ -72,6 +83,7 @@ import com.example.ui.viewmodel.MessagesViewModel
 import com.example.ui.viewmodel.SearchViewModel
 import com.example.ui.viewmodel.SettingsViewModel
 import com.example.ui.viewmodel.TopicViewModel
+import kotlinx.coroutines.launch
 
 private object AppRoutes {
     const val FEED = "feed"
@@ -110,9 +122,13 @@ private enum class TopDestination(
 }
 
 class MainActivity : ComponentActivity() {
+    private var pendingMessageThreadUrl by mutableStateOf<String?>(null)
+    private var pendingOpenMessagesTab by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        consumeNotificationIntent(intent)
         val appContainer = (application as EksiApplication).container
 
         setContent {
@@ -133,9 +149,39 @@ class MainActivity : ComponentActivity() {
             ) {
                 EksiOkurApp(
                     factory = EksiViewModelFactory(appContainer.repository),
-                    expandSpoilersByDefault = prefs.expandSpoilersByDefault
+                    prefs = prefs,
+                    onMarkNotificationPermissionAsked = {
+                        appContainer.repository.preferences.setHasAskedNotificationPermission(true)
+                    },
+                    pendingMessageThreadUrl = pendingMessageThreadUrl,
+                    pendingOpenMessagesTab = pendingOpenMessagesTab,
+                    onConsumeNotificationNav = {
+                        pendingMessageThreadUrl = null
+                        pendingOpenMessagesTab = false
+                    }
                 )
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        consumeNotificationIntent(intent)
+    }
+
+    private fun consumeNotificationIntent(intent: Intent?) {
+        if (intent == null) return
+        val threadUrl = intent.getStringExtra(MessageNotificationHelper.EXTRA_MESSAGE_THREAD_URL)
+        val openMessages = intent.getBooleanExtra(MessageNotificationHelper.EXTRA_OPEN_MESSAGES_TAB, false)
+        if (!threadUrl.isNullOrBlank()) {
+            pendingMessageThreadUrl = threadUrl
+            pendingOpenMessagesTab = true
+            intent.removeExtra(MessageNotificationHelper.EXTRA_MESSAGE_THREAD_URL)
+            intent.removeExtra(MessageNotificationHelper.EXTRA_OPEN_MESSAGES_TAB)
+        } else if (openMessages) {
+            pendingOpenMessagesTab = true
+            intent.removeExtra(MessageNotificationHelper.EXTRA_OPEN_MESSAGES_TAB)
         }
     }
 }
@@ -143,11 +189,43 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun EksiOkurApp(
     factory: EksiViewModelFactory,
-    expandSpoilersByDefault: Boolean
+    prefs: UserPreferences,
+    onMarkNotificationPermissionAsked: suspend () -> Unit,
+    pendingMessageThreadUrl: String? = null,
+    pendingOpenMessagesTab: Boolean = false,
+    onConsumeNotificationNav: () -> Unit = {}
 ) {
+    val expandSpoilersByDefault = prefs.expandSpoilersByDefault
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted && prefs.messageNotificationsEnabled) {
+            MessageNotificationScheduler.syncPeriodicWork(context, true)
+        }
+    }
+
+    LaunchedEffect(
+        prefs.loggedInNick,
+        prefs.messageNotificationsEnabled,
+        prefs.hasAskedNotificationPermission
+    ) {
+        if (prefs.loggedInNick != null && prefs.messageNotificationsEnabled) {
+            MessageNotificationScheduler.syncPeriodicWork(context, true)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                !prefs.hasAskedNotificationPermission &&
+                !MessageNotificationHelper.hasNotificationPermission(context)
+            ) {
+                coroutineScope.launch { onMarkNotificationPermissionAsked() }
+                permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
 
     val feedViewModel: FeedViewModel = viewModel(factory = factory)
     val searchViewModel: SearchViewModel = viewModel(factory = factory)
@@ -170,6 +248,20 @@ fun EksiOkurApp(
                 }
                 launchSingleTop = true
                 restoreState = true
+            }
+        }
+
+        LaunchedEffect(pendingMessageThreadUrl, pendingOpenMessagesTab) {
+            val threadUrl = pendingMessageThreadUrl
+            if (!threadUrl.isNullOrBlank()) {
+                navigateTopLevel(TopDestination.MESSAGES)
+                messagesViewModel.loadInbox()
+                navController.navigate(AppRoutes.messageThreadRoute(threadUrl))
+                onConsumeNotificationNav()
+            } else if (pendingOpenMessagesTab) {
+                navigateTopLevel(TopDestination.MESSAGES)
+                messagesViewModel.loadInbox()
+                onConsumeNotificationNav()
             }
         }
 

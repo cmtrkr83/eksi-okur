@@ -27,7 +27,8 @@ class WebViewCookieJar : CookieJar {
         val urlsToCheck = listOf(
             url.toString(),
             "https://eksisozluk.com",
-            "https://www.eksisozluk.com"
+            "https://www.eksisozluk.com",
+            "https://m.eksisozluk.com"
         ).distinct()
 
         val parsed = LinkedHashMap<String, Cookie>()

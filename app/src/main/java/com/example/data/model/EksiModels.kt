@@ -125,7 +125,20 @@ data class MessageFormMeta(
     val action: String,
     val fields: Map<String, String> = emptyMap(),
     val recipientFieldName: String = "To",
-    val bodyFieldName: String = "Message"
+    val bodyFieldName: String = "Message",
+    val hasRecipientInput: Boolean = true,
+    val isAjax: Boolean = false
+)
+
+data class SendMessageOutcome(
+    val redirectPath: String,
+    val responseHtml: String = ""
+)
+
+data class MessageDeleteMeta(
+    val action: String = "/mesaj/sil",
+    val fields: Map<String, String> = emptyMap(),
+    val isAjax: Boolean = false
 )
 
 data class MessageThreadSummary(
@@ -134,12 +147,14 @@ data class MessageThreadSummary(
     val participantNick: String,
     val preview: String,
     val dateText: String,
-    val isUnread: Boolean = false
+    val isUnread: Boolean = false,
+    val deleteMeta: MessageDeleteMeta? = null
 )
 
 data class MessageInboxData(
     val threads: List<MessageThreadSummary> = emptyList(),
     val composeForm: MessageFormMeta? = null,
+    val verificationToken: String? = null,
     val requiresLogin: Boolean = false
 )
 

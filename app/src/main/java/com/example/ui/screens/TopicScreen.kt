@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -60,6 +61,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -69,6 +71,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -124,11 +127,22 @@ fun TopicScreen(
     var showOverflowMenu by remember { mutableStateOf(false) }
     var authDialogUrl by remember { mutableStateOf<String?>(null) }
     var openComposeAfterAuth by remember { mutableStateOf(false) }
+    var retryAppendAfterAuth by remember { mutableStateOf(false) }
 
-    LaunchedEffect(state.actionMessage) {
+    LaunchedEffect(state.actionMessage, state.actionChallengeUrl) {
         val msg = state.actionMessage
+        val cfUrl = state.actionChallengeUrl
         if (msg != null) {
-            snackbarHostState.showSnackbar(msg)
+            val res = snackbarHostState.showSnackbar(
+                message = msg,
+                actionLabel = if (cfUrl != null) "Doğrula" else null,
+                withDismissAction = true
+            )
+            if (res == SnackbarResult.ActionPerformed && cfUrl != null) {
+                openComposeAfterAuth = false
+                retryAppendAfterAuth = false
+                authDialogUrl = cfUrl
+            }
             viewModel.clearMessage()
         }
     }
@@ -149,7 +163,7 @@ fun TopicScreen(
                     Text(
                         text = activeDetail?.title ?: "Başlık",
                         style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
                 },
@@ -251,11 +265,18 @@ fun TopicScreen(
                             detail = res.cachedData,
                             isSingleEntryMode = state.singleEntryId != null,
                             isRefreshing = state.isRefreshing,
+                            isAppendingNextPage = false,
+                            appendError = null,
+                            appendChallengeUrl = null,
+                            scrollToTopTrigger = state.scrollToTopTrigger,
                             isFromCache = true,
                             cachedAtMillis = res.cachedAtMillis,
                             expandSpoilersByDefault = prefs.expandSpoilersByDefault,
                             bookmarkedEntryIds = bookmarkedEntryIds,
                             onRefresh = { viewModel.refresh() },
+                            onLoadNextPage = {},
+                            onRetryNextPage = {},
+                            onVerifyAppendChallenge = {},
                             onSelectFilter = { viewModel.selectFilter(it) },
                             onPageSelected = { viewModel.goToPage(it) },
                             onOpenFullTopic = { viewModel.openFullTopicFromSingleEntry() },
@@ -276,6 +297,7 @@ fun TopicScreen(
                             onOpenBrowserVerify = res.challengeUrl?.let { url ->
                                 {
                                     openComposeAfterAuth = false
+                                    retryAppendAfterAuth = false
                                     authDialogUrl = url
                                 }
                             }
@@ -287,11 +309,22 @@ fun TopicScreen(
                         detail = res.data,
                         isSingleEntryMode = state.singleEntryId != null,
                         isRefreshing = state.isRefreshing,
+                        isAppendingNextPage = state.isAppendingNextPage,
+                        appendError = state.appendError,
+                        appendChallengeUrl = state.appendChallengeUrl,
+                        scrollToTopTrigger = state.scrollToTopTrigger,
                         isFromCache = res.isFromCache,
                         cachedAtMillis = res.cachedAtMillis,
                         expandSpoilersByDefault = prefs.expandSpoilersByDefault,
                         bookmarkedEntryIds = bookmarkedEntryIds,
                         onRefresh = { viewModel.refresh() },
+                        onLoadNextPage = { viewModel.loadNextPage() },
+                        onRetryNextPage = { viewModel.loadNextPage(forceRetry = true) },
+                        onVerifyAppendChallenge = { url ->
+                            openComposeAfterAuth = false
+                            retryAppendAfterAuth = true
+                            authDialogUrl = url
+                        },
                         onSelectFilter = { viewModel.selectFilter(it) },
                         onPageSelected = { viewModel.goToPage(it) },
                         onOpenFullTopic = { viewModel.openFullTopicFromSingleEntry() },
@@ -309,18 +342,18 @@ fun TopicScreen(
         }
     }
 
-    if (state.showLoginPromptForEntry) {
+    state.loginPromptMessage?.let { promptMsg ->
+        val shouldOpenCompose = state.pendingComposeAfterLogin
         AlertDialog(
             onDismissRequest = { viewModel.dismissLoginPrompt() },
             title = { Text("Giriş Gerekli") },
-            text = {
-                Text("Bu başlığa entry girebilmek için Ekşi Sözlük hesabınızla oturum açmalısınız.")
-            },
+            text = { Text(promptMsg) },
             confirmButton = {
                 Button(
                     onClick = {
                         viewModel.dismissLoginPrompt()
-                        openComposeAfterAuth = true
+                        openComposeAfterAuth = shouldOpenCompose
+                        retryAppendAfterAuth = false
                         authDialogUrl = "https://eksisozluk.com/giris"
                     }
                 ) {
@@ -353,12 +386,19 @@ fun TopicScreen(
             onDismiss = {
                 authDialogUrl = null
                 openComposeAfterAuth = false
+                retryAppendAfterAuth = false
             },
             onCompleted = { detectedNick ->
                 val shouldOpenCompose = openComposeAfterAuth
+                val shouldRetryAppend = retryAppendAfterAuth
                 authDialogUrl = null
                 openComposeAfterAuth = false
-                viewModel.onWebAuthCompleted(detectedNick, openComposeAfter = shouldOpenCompose)
+                retryAppendAfterAuth = false
+                viewModel.onWebAuthCompleted(
+                    detectedNick = detectedNick,
+                    openComposeAfter = shouldOpenCompose,
+                    retryAppendAfter = shouldRetryAppend
+                )
             }
         )
     }
@@ -370,11 +410,18 @@ private fun TopicDetailBody(
     detail: TopicDetail,
     isSingleEntryMode: Boolean,
     isRefreshing: Boolean,
+    isAppendingNextPage: Boolean,
+    appendError: String?,
+    appendChallengeUrl: String?,
+    scrollToTopTrigger: Int,
     isFromCache: Boolean,
     cachedAtMillis: Long?,
     expandSpoilersByDefault: Boolean,
     bookmarkedEntryIds: Set<Long>,
     onRefresh: () -> Unit,
+    onLoadNextPage: () -> Unit,
+    onRetryNextPage: () -> Unit,
+    onVerifyAppendChallenge: (String) -> Unit,
     onSelectFilter: (TopicFilter) -> Unit,
     onPageSelected: (Int) -> Unit,
     onOpenFullTopic: () -> Unit,
@@ -397,10 +444,41 @@ private fun TopicDetailBody(
     val latestPage by rememberUpdatedState(detail.currentPage)
     val latestTotalPages by rememberUpdatedState(detail.totalPages)
     val latestOnPageSelected by rememberUpdatedState(onPageSelected)
+    val latestOnLoadNextPage by rememberUpdatedState(onLoadNextPage)
 
-    LaunchedEffect(detail.canonicalUrl, detail.currentPage, detail.filter) {
+    LaunchedEffect(scrollToTopTrigger) {
         listState.scrollToItem(0)
         swipeOffsetX.snapTo(0f)
+    }
+
+    val shouldLoadNextPage by remember(
+        detail.canonicalUrl,
+        detail.filter,
+        detail.currentPage,
+        detail.totalPages,
+        detail.entries.size,
+        isSingleEntryMode,
+        isAppendingNextPage,
+        appendError
+    ) {
+        derivedStateOf {
+            if (isSingleEntryMode || isAppendingNextPage || appendError != null) {
+                false
+            } else if (detail.entries.isEmpty() || detail.currentPage >= detail.totalPages) {
+                false
+            } else {
+                val layoutInfo = listState.layoutInfo
+                val totalItems = layoutInfo.totalItemsCount
+                val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+                totalItems > 0 && lastVisibleIndex >= (totalItems - 2).coerceAtLeast(1)
+            }
+        }
+    }
+
+    LaunchedEffect(shouldLoadNextPage) {
+        if (shouldLoadNextPage) {
+            latestOnLoadNextPage()
+        }
     }
 
     Box(
@@ -522,19 +600,13 @@ private fun TopicDetailBody(
                                 modifier = Modifier.padding(horizontal = 0.dp)
                             )
                         }
-                        Text(
-                            text = detail.title,
-                            style = MaterialTheme.typography.headlineMedium,
-                            color = MaterialTheme.colorScheme.onBackground,
-                            modifier = Modifier.padding(vertical = 4.dp)
-                        )
 
                         if (detail.channels.isNotEmpty()) {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .horizontalScroll(rememberScrollState())
-                                    .padding(top = 6.dp),
+                                    .padding(top = if (isFromCache) 8.dp else 2.dp),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 detail.channels.forEach { ch ->
@@ -560,7 +632,9 @@ private fun TopicDetailBody(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .horizontalScroll(rememberScrollState())
-                                    .padding(top = 10.dp),
+                                    .padding(
+                                        top = if (detail.channels.isNotEmpty() || isFromCache) 10.dp else 2.dp
+                                    ),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 TopicFilter.entries.forEach { filter ->
@@ -587,7 +661,9 @@ private fun TopicDetailBody(
                                 }
                             }
                         } else {
-                            Spacer(Modifier.height(10.dp))
+                            if (detail.channels.isNotEmpty() || isFromCache) {
+                                Spacer(Modifier.height(10.dp))
+                            }
                             Button(
                                 onClick = onOpenFullTopic,
                                 modifier = Modifier.testTag("single_entry_full_topic_btn")
@@ -621,6 +697,88 @@ private fun TopicDetailBody(
                             onFavoriteClick = { onFavoriteClick(entry) },
                             onBookmarkClick = { onBookmarkEntryClick(entry) }
                         )
+                    }
+
+                    if (!isSingleEntryMode) {
+                        when {
+                            isAppendingNextPage -> {
+                                item(key = "topic_append_loading") {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 16.dp)
+                                            .testTag("topic_append_loading"),
+                                        horizontalArrangement = Arrangement.Center,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(20.dp),
+                                            strokeWidth = 2.dp,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                        Spacer(Modifier.width(10.dp))
+                                        Text(
+                                            text = "Sayfa ${detail.currentPage + 1} yükleniyor…",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                            appendError != null -> {
+                                item(key = "topic_append_error") {
+                                    Surface(
+                                        shape = RoundedCornerShape(14.dp),
+                                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.65f),
+                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("topic_append_error")
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(14.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Text(
+                                                text = appendError,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onErrorContainer
+                                            )
+                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                Button(
+                                                    onClick = onRetryNextPage,
+                                                    modifier = Modifier.testTag("topic_append_retry_button")
+                                                ) {
+                                                    Text("Sonraki Sayfayı Dene")
+                                                }
+                                                appendChallengeUrl?.let { challenge ->
+                                                    TextButton(
+                                                        onClick = { onVerifyAppendChallenge(challenge) },
+                                                        modifier = Modifier.testTag("topic_append_verify_button")
+                                                    ) {
+                                                        Text("Doğrula")
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            detail.currentPage >= detail.totalPages && detail.totalPages > 1 -> {
+                                item(key = "topic_end_footer") {
+                                    Text(
+                                        text = "Başlığın sonuna ulaştınız",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 12.dp)
+                                            .wrapContentWidth(Alignment.CenterHorizontally)
+                                            .testTag("topic_end_footer")
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }

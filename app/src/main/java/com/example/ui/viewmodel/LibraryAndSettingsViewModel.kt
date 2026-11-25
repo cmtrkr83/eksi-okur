@@ -7,6 +7,7 @@ import com.example.data.local.FontScaleOption
 import com.example.data.local.ReadingHistoryEntity
 import com.example.data.local.ThemeMode
 import com.example.data.local.UserPreferences
+import com.example.data.model.MessageThreadSummary
 import com.example.data.repository.EksiRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -57,6 +58,37 @@ class SettingsViewModel(
 
     fun setUseDynamicColor(useDynamic: Boolean) {
         viewModelScope.launch { repository.preferences.setUseDynamicColor(useDynamic) }
+    }
+
+    fun setMessageNotificationsEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.preferences.setMessageNotificationsEnabled(enabled)
+            _statusMessage.value = if (enabled) {
+                "Özel mesaj bildirimleri açıldı"
+            } else {
+                "Özel mesaj bildirimleri kapatıldı"
+            }
+        }
+    }
+
+    fun showStatusMessage(message: String) {
+        _statusMessage.value = message
+    }
+
+    fun checkMessagesNow(onUnreadFound: (List<MessageThreadSummary>) -> Unit) {
+        viewModelScope.launch {
+            val res = repository.fetchUnreadMessagesForNotification(ignoreSeenCache = true)
+            res.onSuccess { threads ->
+                if (threads.isNotEmpty()) {
+                    onUnreadFound(threads)
+                    _statusMessage.value = "${threads.size} okunmamış özel mesaj bildirimi gönderildi"
+                } else {
+                    _statusMessage.value = "Yeni okunmamış özel mesaj yok"
+                }
+            }.onFailure { err ->
+                _statusMessage.value = err.message ?: "Mesajlar kontrol edilemedi"
+            }
+        }
     }
 
     fun refreshSession(fallbackNick: String? = null) {

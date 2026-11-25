@@ -1,21 +1,34 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -29,9 +42,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Login
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.outlined.Archive
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Mail
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Inbox
+import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -47,12 +62,14 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.SuggestionChip
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -60,23 +77,33 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import com.example.data.model.MessageThreadSummary
 import com.example.data.model.UiResult
+import com.example.notifications.MessageNotificationHelper
+import com.example.notifications.MessageNotificationScheduler
 import com.example.ui.components.EmptyEditorialView
 import com.example.ui.components.ErrorStateView
 import com.example.ui.components.LoadingCenterView
 import com.example.ui.components.WebAuthDialog
+import com.example.ui.components.WebThreadDeleteDialog
 import com.example.ui.viewmodel.MessagesViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -88,20 +115,54 @@ fun MessagesScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val prefs by viewModel.preferences.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     var authDialogUrl by remember { mutableStateOf<String?>(null) }
+    var revealedThreadId by remember { mutableStateOf<String?>(null) }
+    var hasNotificationPermission by remember {
+        mutableStateOf(MessageNotificationHelper.hasNotificationPermission(context))
+    }
 
-    LaunchedEffect(state.actionMessage) {
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasNotificationPermission = granted || MessageNotificationHelper.hasNotificationPermission(context)
+        if (hasNotificationPermission) {
+            MessageNotificationScheduler.syncPeriodicWork(context, true)
+            MessageNotificationScheduler.triggerImmediateCheck(context)
+        }
+    }
+
+    LaunchedEffect(state.showArchived) {
+        revealedThreadId = null
+    }
+
+    LaunchedEffect(state.actionMessage, state.deleteChallengeUrl) {
         val msg = state.actionMessage
+        val cfUrl = state.deleteChallengeUrl
         if (msg != null) {
-            snackbarHostState.showSnackbar(msg)
+            val result = snackbarHostState.showSnackbar(
+                message = msg,
+                actionLabel = if (cfUrl != null) "Doğrula" else null,
+                withDismissAction = true
+            )
+            if (result == SnackbarResult.ActionPerformed && cfUrl != null) {
+                authDialogUrl = cfUrl
+            }
             viewModel.clearActionMessage()
+            viewModel.clearDeleteChallenge()
         }
     }
 
     val inboxSuccess = (state.inboxResult as? UiResult.Success)?.data
     val canCompose = inboxSuccess?.requiresLogin == false ||
         (inboxSuccess == null && prefs.loggedInNick != null)
+
+    LaunchedEffect(inboxSuccess) {
+        if (inboxSuccess != null && !inboxSuccess.requiresLogin) {
+            MessageNotificationHelper.cancelAllMessageNotifications(context)
+        }
+    }
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
@@ -185,6 +246,49 @@ fun MessagesScreen(
                 )
             }
 
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                canCompose &&
+                prefs.messageNotificationsEnabled &&
+                !hasNotificationPermission
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.NotificationsActive,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.secondary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Text(
+                            text = "Yeni özel mesaj geldiğinde bildirim almak için izin verin.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.weight(1f)
+                        )
+                        TextButton(
+                            onClick = {
+                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            },
+                            modifier = Modifier.testTag("messages_enable_notifications_button")
+                        ) {
+                            Text("Aç")
+                        }
+                    }
+                }
+            }
+
             Box(modifier = Modifier.weight(1f)) {
                 when (val res = state.inboxResult) {
                     is UiResult.Loading -> {
@@ -237,9 +341,42 @@ fun MessagesScreen(
                                             items = res.data.threads,
                                             key = { it.threadUrl }
                                         ) { thread ->
-                                            MessageThreadRow(
+                                            SwipeableMessageThreadRow(
                                                 thread = thread,
-                                                onClick = { onOpenThread(thread.threadUrl) }
+                                                isRevealed = revealedThreadId == thread.threadId,
+                                                isDeleting = thread.threadId in state.deletingThreadIds,
+                                                onSwipeStart = {
+                                                    if (revealedThreadId != null && revealedThreadId != thread.threadId) {
+                                                        revealedThreadId = null
+                                                    }
+                                                },
+                                                onRevealChange = { reveal ->
+                                                    revealedThreadId = if (reveal) {
+                                                        thread.threadId
+                                                    } else if (revealedThreadId == thread.threadId) {
+                                                        null
+                                                    } else {
+                                                        revealedThreadId
+                                                    }
+                                                },
+                                                onClick = {
+                                                    if (revealedThreadId != null) {
+                                                        revealedThreadId = null
+                                                    } else {
+                                                        onOpenThread(thread.threadUrl)
+                                                    }
+                                                },
+                                                onDeleteClick = {
+                                                    viewModel.deleteThread(thread) {
+                                                        MessageNotificationHelper.cancelThreadNotification(
+                                                            context,
+                                                            thread.threadUrl
+                                                        )
+                                                        if (revealedThreadId == thread.threadId) {
+                                                            revealedThreadId = null
+                                                        }
+                                                    }
+                                                }
                                             )
                                         }
                                     }
@@ -252,7 +389,7 @@ fun MessagesScreen(
         }
     }
 
-    if (state.isComposeOpen) {
+    if (state.isComposeOpen && canCompose) {
         val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         var messageBody by rememberSaveable(state.composeRecipient) { mutableStateOf("") }
 
@@ -391,7 +528,150 @@ fun MessagesScreen(
             onCompleted = { detectedNick ->
                 authDialogUrl = null
                 viewModel.onWebLoginCompleted(detectedNick)
+                if (prefs.messageNotificationsEnabled) {
+                    MessageNotificationScheduler.syncPeriodicWork(context, true)
+                }
             }
+        )
+    }
+
+    state.pendingWebDelete?.let { req ->
+        WebThreadDeleteDialog(
+            targetUrl = req.targetUrl,
+            threadId = req.threadId,
+            threadPath = req.threadPath,
+            participantNick = req.thread.participantNick,
+            onDismiss = { viewModel.dismissWebThreadDelete() },
+            onVerifyCompleted = {
+                viewModel.onWebThreadDeleteCompleted(req) {
+                    MessageNotificationHelper.cancelThreadNotification(
+                        context,
+                        req.thread.threadUrl
+                    )
+                    if (revealedThreadId == req.thread.threadId) {
+                        revealedThreadId = null
+                    }
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun SwipeableMessageThreadRow(
+    thread: MessageThreadSummary,
+    isRevealed: Boolean,
+    isDeleting: Boolean,
+    onSwipeStart: () -> Unit,
+    onRevealChange: (Boolean) -> Unit,
+    onClick: () -> Unit,
+    onDeleteClick: () -> Unit
+) {
+    val revealWidthDp = 92.dp
+    val revealWidthPx = with(LocalDensity.current) { revealWidthDp.toPx() }
+    val offsetX = remember(thread.threadId) { Animatable(0f) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(isRevealed, isDeleting) {
+        val target = if (isRevealed || isDeleting) revealWidthPx else 0f
+        if (offsetX.value != target) {
+            offsetX.animateTo(
+                targetValue = target,
+                animationSpec = spring(
+                    dampingRatio = 0.85f,
+                    stiffness = Spring.StiffnessMediumLow
+                )
+            )
+        }
+    }
+
+    val draggableState = rememberDraggableState { delta ->
+        scope.launch {
+            val next = (offsetX.value + delta).coerceIn(0f, revealWidthPx)
+            offsetX.snapTo(next)
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(IntrinsicSize.Min)
+            .clipToBounds()
+    ) {
+        if (offsetX.value > 0.5f || isDeleting) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.error),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                Box(
+                    modifier = Modifier
+                        .width(revealWidthDp)
+                        .fillMaxHeight()
+                        .minimumInteractiveComponentSize()
+                        .clickable(enabled = !isDeleting, onClick = onDeleteClick)
+                        .testTag("message_thread_delete_${thread.threadId}"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        if (isDeleting) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onError
+                            )
+                            Text(
+                                text = "Siliniyor",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onError
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Outlined.Delete,
+                                contentDescription = "Mesajı sil",
+                                tint = MaterialTheme.colorScheme.onError,
+                                modifier = Modifier.size(22.dp)
+                            )
+                            Text(
+                                text = "Sil",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onError
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        MessageThreadRow(
+            thread = thread,
+            onClick = onClick,
+            modifier = Modifier
+                .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+                .draggable(
+                    state = draggableState,
+                    orientation = Orientation.Horizontal,
+                    enabled = !isDeleting,
+                    onDragStarted = { onSwipeStart() },
+                    onDragStopped = { velocity ->
+                        val shouldReveal = velocity > 450f ||
+                            (velocity >= -250f && offsetX.value >= revealWidthPx * 0.42f)
+                        onRevealChange(shouldReveal)
+                        scope.launch {
+                            offsetX.animateTo(
+                                targetValue = if (shouldReveal) revealWidthPx else 0f,
+                                animationSpec = spring(
+                                    dampingRatio = 0.85f,
+                                    stiffness = Spring.StiffnessMediumLow
+                                )
+                            )
+                        }
+                    }
+                )
         )
     }
 }
@@ -399,9 +679,10 @@ fun MessagesScreen(
 @Composable
 private fun MessageThreadRow(
     thread: MessageThreadSummary,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    val bgColor = if (thread.isUnread) {
+    val tintOverlay = if (thread.isUnread) {
         MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
     } else {
         MaterialTheme.colorScheme.surface
@@ -409,9 +690,10 @@ private fun MessageThreadRow(
     val initial = thread.participantNick.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "?"
 
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .background(bgColor)
+            .background(MaterialTheme.colorScheme.surface)
+            .background(tintOverlay)
             .clickable(onClick = onClick)
             .testTag("message_thread_${thread.threadId}")
     ) {

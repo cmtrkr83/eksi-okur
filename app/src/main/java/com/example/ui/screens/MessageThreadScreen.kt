@@ -29,6 +29,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Login
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.outlined.Mail
+import androidx.compose.material.icons.outlined.OpenInBrowser
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -66,6 +67,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.model.DirectMessageItem
 import com.example.data.model.EntrySegment
 import com.example.data.model.UiResult
+import com.example.notifications.MessageNotificationHelper
 import com.example.ui.components.EmptyEditorialView
 import com.example.ui.components.EntryRichBody
 import com.example.ui.components.ErrorStateView
@@ -93,8 +95,11 @@ fun MessageThreadScreen(
     var pendingClearReply by remember { mutableStateOf(false) }
 
     LaunchedEffect(threadUrl) {
-        if (threadUrl.isNotBlank() && state.activeThreadUrl != threadUrl) {
-            viewModel.loadThread(threadUrl)
+        if (threadUrl.isNotBlank()) {
+            MessageNotificationHelper.cancelThreadNotification(context, threadUrl)
+            if (state.activeThreadUrl != threadUrl) {
+                viewModel.loadThread(threadUrl)
+            }
         }
     }
 
@@ -149,7 +154,27 @@ fun MessageThreadScreen(
                 },
                 actions = {
                     IconButton(
-                        onClick = { viewModel.loadThread(threadUrl, isPullRefresh = false) },
+                        onClick = {
+                            val activeUrl = state.activeThreadUrl ?: threadUrl
+                            val fullUrl = if (activeUrl.startsWith("http")) {
+                                activeUrl
+                            } else {
+                                "https://eksisozluk.com$activeUrl"
+                            }
+                            authDialogUrl = fullUrl
+                        },
+                        modifier = Modifier.testTag("thread_open_web_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.OpenInBrowser,
+                            contentDescription = "Web'de aç"
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            val activeUrl = state.activeThreadUrl ?: threadUrl
+                            viewModel.loadThread(activeUrl, isPullRefresh = false)
+                        },
                         modifier = Modifier.testTag("thread_refresh_button")
                     ) {
                         Icon(Icons.Rounded.Refresh, contentDescription = "Yenile")
@@ -174,14 +199,25 @@ fun MessageThreadScreen(
                     ) {
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                         state.replyError?.let { err ->
-                            Text(
-                                text = err,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.error,
+                            Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 6.dp)
-                            )
+                                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = err,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                state.replyChallengeUrl?.let { challengeUrl ->
+                                    TextButton(onClick = { authDialogUrl = challengeUrl }) {
+                                        Text("Doğrula")
+                                    }
+                                }
+                            }
                         }
                         Row(
                             modifier = Modifier
